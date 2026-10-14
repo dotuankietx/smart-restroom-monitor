@@ -13,10 +13,6 @@ primary_region = "sin"
   OFFLINE_TIMEOUT_SECONDS = "120"
   OFFLINE_CHECK_INTERVAL_SECONDS = "15"
 
-[[mounts]]
-  source = "restroom_data"
-  destination = "/data"
-
 [http_service]
   internal_port = 8080
   force_https = true
