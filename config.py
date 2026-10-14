@@ -44,7 +44,7 @@ def calculate_paper_percent(distance_mm: float, sensor_status: int = 0) -> float
     return max(0.0, min(100.0, round(float(percent), 1)))
 
 # Uploads
-UPLOAD_DIR = BASE_DIR / "uploads"
+UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", str(BASE_DIR / "uploads")))
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 MAX_FILE_SIZE_BYTES = 20 * 1024 * 1024  # 20MB
 ALLOWED_EXTENSIONS = {".pdf"}
