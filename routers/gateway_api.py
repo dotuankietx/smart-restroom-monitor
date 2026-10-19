@@ -90,7 +90,7 @@ async def receive_gateway_report(
         metrics = calculate_paper_metrics(raw_dist, sensor_st)
         calc_paper = metrics["paper_level"]
         new_status = metrics["status"]
-        print(f"[Device Report] {clean_mac} -> dist={raw_dist}mm, st={sensor_st}, paper={calc_paper}%, thick={metrics['remaining_thickness_cm']}cm, uses={metrics['estimated_uses']}, status={new_status}")
+        print(f"[Device Report] {clean_mac} -> dist={raw_dist}mm, st={sensor_st}, paper={calc_paper}%, thick={metrics['remaining_thickness_cm']}cm, uses={metrics['estimated_uses']}, bat={dev_in.battery}%, status={new_status}")
 
         if not device:
             # Client is active but NOT saved into database (per user requirement)

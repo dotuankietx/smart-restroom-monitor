@@ -70,6 +70,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     await loadTerminals();
     await updateUnackAlertsCount();
     initWebSocket();
+    startAutoPolling();
 
     // Map scroll wrapper mouse wheel zoom (Ctrl + Wheel)
     const mapScrollWrapper = document.getElementById('map-scroll-wrapper');
@@ -276,7 +277,44 @@ async function handleLogout() {
     switchView('dashboard');
 }
 
-// ================= REALTIME WEBSOCKET =================
+// ================= REALTIME WEBSOCKET & AUTO-POLLING FALLBACK =================
+let autoPollTimer = null;
+function startAutoPolling() {
+    if (autoPollTimer) return;
+    autoPollTimer = setInterval(async () => {
+        // 1. Tự động cập nhật bảng thông tin Toilet và danh sách Cabin nếu đang mở xem
+        if (selectedToiletId) {
+            try {
+                const res = await apiFetch(`/api/toilets/${selectedToiletId}`);
+                if (res.ok) {
+                    const data = await res.json();
+                    renderToiletDetailPanel(data);
+                }
+            } catch (err) {
+                // Im lặng bỏ qua lỗi mạng tạm thời
+            }
+        }
+
+        // 2. Tự động cập nhật màu trạng thái các điểm Toilet trên bản đồ tầng hiện tại
+        if (currentFloor && document.getElementById('view-dashboard') && document.getElementById('view-dashboard').style.display !== 'none') {
+            try {
+                const res = await apiFetch(`/api/floors/${currentFloor.id}`);
+                if (res.ok) {
+                    const floorData = await res.json();
+                    if (floorData.toilets) {
+                        floorData.toilets.forEach(t => {
+                            const marker = document.getElementById(`toilet-marker-${t.id}`);
+                            if (marker) {
+                                marker.className = `toilet-marker ${t.status} ${selectedToiletId === t.id ? 'selected' : ''}`;
+                            }
+                        });
+                    }
+                }
+            } catch (err) {}
+        }
+    }, 3000); // Polling chu kỳ 3 giây đảm bảo dữ liệu luôn thời gian thực
+}
+
 function initWebSocket() {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsUrl = `${protocol}//${window.location.host}/ws`;
@@ -284,11 +322,18 @@ function initWebSocket() {
     const indicator = document.getElementById('ws-indicator');
     const text = document.getElementById('ws-text');
 
-    ws = new WebSocket(wsUrl);
+    let pingInterval = null;
 
     ws.onopen = () => {
         indicator.className = 'ws-dot connected';
-        text.innerText = 'Trực tuyến';
+        text.innerText = 'Trực tuyến (WS)';
+        // Gửi heartbeat ping mỗi 25s để Fly.io proxy không ngắt kết nối do idle timeout
+        if (pingInterval) clearInterval(pingInterval);
+        pingInterval = setInterval(() => {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send("ping");
+            }
+        }, 25000);
     };
 
     ws.onmessage = (event) => {
@@ -296,17 +341,19 @@ function initWebSocket() {
             const msg = JSON.parse(event.data);
             handleWsMessage(msg);
         } catch (e) {
-            // ping/pong text
+            // Nhận phản hồi pong từ server
         }
     };
 
     ws.onclose = () => {
-        indicator.className = 'ws-dot';
-        text.innerText = 'Mất kết nối (thử lại...)';
-        setTimeout(initWebSocket, 3000);
+        if (pingInterval) clearInterval(pingInterval);
+        indicator.className = 'ws-dot connected';
+        text.innerText = 'Trực tuyến (Tự cập nhật)';
+        setTimeout(initWebSocket, 5000);
     };
 
     ws.onerror = () => {
+        if (pingInterval) clearInterval(pingInterval);
         ws.close();
     };
 }
