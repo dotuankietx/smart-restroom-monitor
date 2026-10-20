@@ -125,7 +125,7 @@ function updateUserUI() {
     const editToiletBtn = document.getElementById('btn-edit-toilet-panel');
 
     if (currentUser) {
-        profileBox.style.display = 'flex';
+        profileBox.style.display = 'inline-block';
         loginBtn.style.display = 'none';
         document.getElementById('display-username').innerText = currentUser.username;
         const roleBadge = document.getElementById('display-role');
@@ -155,6 +155,47 @@ function updateUserUI() {
         if (editToiletBtn) editToiletBtn.style.display = 'none';
     }
 }
+
+function toggleUserDropdown(e) {
+    if (e) {
+        e.preventDefault();
+        e.stopPropagation();
+    }
+    const menu = document.getElementById('user-dropdown-menu');
+    const btn = document.getElementById('btn-user-dropdown');
+    if (menu) {
+        const isShown = menu.classList.contains('show') || menu.style.display === 'block';
+        if (isShown) {
+            menu.classList.remove('show');
+            menu.style.display = 'none';
+            if (btn) btn.classList.remove('active');
+        } else {
+            menu.classList.add('show');
+            menu.style.display = 'block';
+            if (btn) btn.classList.add('active');
+        }
+    }
+}
+
+function closeUserDropdown() {
+    const menu = document.getElementById('user-dropdown-menu');
+    const btn = document.getElementById('btn-user-dropdown');
+    if (menu) {
+        menu.classList.remove('show');
+        menu.style.display = 'none';
+    }
+    if (btn) {
+        btn.classList.remove('active');
+    }
+}
+
+// Close dropdown on outside click
+document.addEventListener('click', (e) => {
+    const container = document.getElementById('user-profile-box');
+    if (container && !container.contains(e.target)) {
+        closeUserDropdown();
+    }
+});
 
 function openLoginModal() {
     document.getElementById('login-error').style.display = 'none';
@@ -324,9 +365,16 @@ function initWebSocket() {
 
     let pingInterval = null;
 
+    try {
+        ws = new WebSocket(wsUrl);
+    } catch (err) {
+        console.error("Lỗi khởi tạo WebSocket:", err);
+        return;
+    }
+
     ws.onopen = () => {
         indicator.className = 'ws-dot connected';
-        text.innerText = 'Trực tuyến (WS)';
+        text.innerText = 'Trực tuyến';
         // Gửi heartbeat ping mỗi 25s để Fly.io proxy không ngắt kết nối do idle timeout
         if (pingInterval) clearInterval(pingInterval);
         pingInterval = setInterval(() => {
@@ -348,7 +396,7 @@ function initWebSocket() {
     ws.onclose = () => {
         if (pingInterval) clearInterval(pingInterval);
         indicator.className = 'ws-dot connected';
-        text.innerText = 'Trực tuyến (Tự cập nhật)';
+        text.innerText = 'Trực tuyến';
         setTimeout(initWebSocket, 5000);
     };
 
@@ -363,9 +411,20 @@ function handleWsMessage(msg) {
         const data = msg.data;
         // Update floor markers if current floor matches
         if (currentFloor && currentFloor.id === data.floor_id) {
+            // Update in-memory currentFloorToilets so subsequent renderMarkers preserves the status
+            const t = currentFloorToilets.find(x => x.id === data.toilet_id);
+            if (t) {
+                t.status = data.status;
+                if (data.gateway_online !== undefined) t.gateway_online = data.gateway_online;
+            }
             const marker = document.getElementById(`toilet-marker-${data.toilet_id}`);
             if (marker) {
                 marker.className = `toilet-marker ${data.status} ${selectedToiletId === data.toilet_id ? 'selected' : ''}`;
+                const label = marker.querySelector('.marker-label');
+                if (label) {
+                    const statusText = (data.status === 'OFFLINE') ? 'Mất kết nối' : (t ? `${Math.round(t.min_paper)}%` : '');
+                    label.innerText = `${data.toilet_name || (t ? t.name : '')} (${statusText})`;
+                }
             }
         }
         // Update detail panel if this toilet is currently selected
@@ -498,6 +557,8 @@ async function onFloorChanged() {
         toggleRepositionToiletMode();
     }
     selectedToiletId = null;
+    closeChart();
+    document.getElementById('panel-body').style.display = 'none';
 
     document.getElementById('map-loading').style.display = 'block';
     document.getElementById('map-canvas-container').style.display = 'none';
@@ -641,17 +702,39 @@ function renderMarkers() {
         const isSelected = (selectedToiletId === t.id);
         const isRepositioningThis = (isRepositioningToilet && isSelected && currentUser && currentUser.role === 'admin');
 
-        marker.className = `toilet-marker ${t.status} ${isSelected ? 'selected' : ''} ${isRepositioningThis ? 'reposition-active' : ''}`;
+        const hasGateway = !!(t.gateway_id || t.gateway_ip);
+        const isGwOnline = !!t.gateway_online;
+        const hasDevices = (t.device_count > 0 || (t.devices && t.devices.length > 0));
+
+        // Chỉ hiển thị màu sắc hoạt động (OK / LOW / EMPTY) khi CÓ TÍN HIỆU ĐANG ĐƯỢC SỬ DỤNG
+        // Nếu không có gateway hoặc mất kết nối gateway hoặc chưa có thiết bị -> luôn để màu xám (OFFLINE)
+        const isLiveAndInUse = hasGateway && isGwOnline && hasDevices;
+        const effectiveStatus = isLiveAndInUse ? t.status : 'OFFLINE';
+
+        marker.className = `toilet-marker ${effectiveStatus} ${isSelected ? 'selected' : ''} ${isRepositioningThis ? 'reposition-active' : ''}`;
         marker.style.left = `${t.x * 100}%`;
         marker.style.top = `${t.y * 100}%`;
-        marker.title = `${t.name} (Giấy: ${Math.round(t.min_paper)}%)`;
+
+        let statusText = '';
+        if (!hasGateway) {
+            statusText = 'Chưa gán Gateway';
+        } else if (!isGwOnline) {
+            statusText = 'Mất kết nối Gateway';
+        } else if (!hasDevices) {
+            statusText = 'Chưa có thiết bị';
+        } else if (effectiveStatus === 'OFFLINE') {
+            statusText = 'Mất kết nối thiết bị';
+        } else {
+            statusText = `${Math.round(t.min_paper)}%`;
+        }
+        marker.title = `${t.name} (${statusText})`;
 
         marker.innerHTML = `
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
                 <path d="M7 21h10a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2H7a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2z"></path>
                 <circle cx="12" cy="5" r="2"></circle>
             </svg>
-            <div class="marker-label">${t.name} (${Math.round(t.min_paper)}%)</div>
+            <div class="marker-label">${t.name} (${statusText})</div>
         `;
 
         // Click to view details
@@ -756,6 +839,9 @@ function makeMarkerDraggable(marker, toilet) {
 async function selectToilet(toiletId) {
     selectedToiletId = toiletId;
 
+    // Đóng biểu đồ lịch sử của buồng trước đó khi chọn nhà vệ sinh mới
+    closeChart();
+
     // Highlight selected marker
     document.querySelectorAll('.toilet-marker').forEach(m => m.classList.remove('selected'));
     const selM = document.getElementById(`toilet-marker-${toiletId}`);
@@ -774,15 +860,52 @@ async function selectToilet(toiletId) {
 function renderToiletDetailPanel(data) {
     currentSelectedToiletData = data;
     document.getElementById('panel-body').style.display = 'block';
+
+    // Đảm bảo đóng biểu đồ lịch sử nếu nhà vệ sinh này không có buồng nào
+    const savedDevices = data.devices || [];
+    const discoveredDevices = data.discovered_devices || [];
+    if (savedDevices.length === 0 && discoveredDevices.length === 0) {
+        closeChart();
+    }
+
     document.getElementById('panel-toilet-name').innerText = data.name;
     document.getElementById('panel-toilet-sub').innerText = `${data.terminal_name || ''} • ${data.floor_name || ''}`;
     
+    const hasGateway = !!data.gateway_ip;
+    const isGwOnline = !!data.gateway_online;
+    const hasDevices = (savedDevices.length > 0);
+    const isLiveAndInUse = hasGateway && isGwOnline && hasDevices;
+    const effectiveStatus = isLiveAndInUse ? data.status : 'OFFLINE';
+
     const statusPill = document.getElementById('panel-toilet-status');
     statusPill.style.display = 'inline-flex';
-    statusPill.className = `status-pill ${data.status}`;
-    statusPill.innerText = `● ${data.status}`;
+    statusPill.className = `status-pill ${effectiveStatus}`;
+    if (!hasGateway) {
+        statusPill.innerText = `● Chưa gán Gateway`;
+    } else if (!isGwOnline) {
+        statusPill.innerText = `● Mất kết nối`;
+    } else if (!hasDevices) {
+        statusPill.innerText = `● Chưa có thiết bị`;
+    } else {
+        statusPill.innerText = `● ${data.status}`;
+    }
 
     document.getElementById('panel-gw-ip').innerText = data.gateway_ip || 'Chưa gán Gateway';
+    const gwStatusEl = document.getElementById('panel-gw-status');
+    const pingBtn = document.getElementById('btn-ping-gw');
+
+    if (data.gateway_ip) {
+        if (pingBtn) pingBtn.style.display = 'inline-block';
+        if (data.gateway_online) {
+            gwStatusEl.innerHTML = `<span style="background: #dcfce7; color: #15803d; border: 1px solid #86efac; padding: 1px 6px; border-radius: 9999px; font-weight: 600;">🟢 Online</span>`;
+        } else {
+            gwStatusEl.innerHTML = `<span style="background: #fee2e2; color: #b91c1c; border: 1px solid #fecaca; padding: 1px 6px; border-radius: 9999px; font-weight: 600;">🔴 Mất kết nối</span>`;
+        }
+    } else {
+        if (pingBtn) pingBtn.style.display = 'none';
+        gwStatusEl.innerHTML = `<span style="background: #f1f5f9; color: #64748b; border: 1px solid #cbd5e1; padding: 1px 6px; border-radius: 9999px; font-weight: 600;">⚪ Chưa gán</span>`;
+    }
+
     const coordsEl = document.getElementById('panel-coords');
     if (coordsEl) {
         coordsEl.innerText = `X: ${Math.round((data.x || 0) * 100)}%, Y: ${Math.round((data.y || 0) * 100)}%`;
@@ -790,9 +913,6 @@ function renderToiletDetailPanel(data) {
 
     const cabinList = document.getElementById('panel-cabin-list');
     cabinList.innerHTML = '';
-
-    const savedDevices = data.devices || [];
-    const discoveredDevices = data.discovered_devices || [];
 
     if (savedDevices.length === 0 && discoveredDevices.length === 0) {
         cabinList.innerHTML = '<div style="color: var(--text-muted); font-size: 0.85rem; padding: 0.5rem 0;">Chưa có thiết bị ESP nào kết nối vào Gateway này.</div>';
@@ -902,6 +1022,12 @@ function updateToiletDetailPanelFromWs(wsData) {
     if (currentSelectedToiletData && currentSelectedToiletData.id === wsData.toilet_id) {
         currentSelectedToiletData.status = wsData.status;
         currentSelectedToiletData.devices = wsData.devices;
+        if (wsData.gateway_online !== undefined) {
+            currentSelectedToiletData.gateway_online = wsData.gateway_online;
+        }
+        if (wsData.gateway_ip) {
+            currentSelectedToiletData.gateway_ip = wsData.gateway_ip;
+        }
         if (wsData.discovered_devices !== undefined) {
             currentSelectedToiletData.discovered_devices = wsData.discovered_devices;
         }
@@ -922,6 +1048,100 @@ function quickSaveDiscoveredDevice(mac, gatewayId, toiletId) {
         macInput.value = mac;
         macInput.style.borderColor = '#10b981';
         macInput.style.backgroundColor = '#ecfdf5';
+    }
+}
+
+// ================= KIỂM TRA KẾT NỐI GATEWAY =================
+async function checkCurrentGatewayConnection() {
+    if (!currentSelectedToiletData || !currentSelectedToiletData.gateway_ip) {
+        showToast("Nhà vệ sinh này chưa được gán Gateway", "LOW");
+        return;
+    }
+
+    const gwIp = currentSelectedToiletData.gateway_ip;
+    const btn = document.getElementById('btn-ping-gw');
+    const originalText = btn ? btn.innerText : "🔍 Kiểm tra kết nối";
+    if (btn) {
+        btn.innerText = "⏳ Đang kiểm tra...";
+        btn.disabled = true;
+    }
+
+    try {
+        const res = await apiFetch(`/api/admin/gateways/ping?ip=${encodeURIComponent(gwIp)}`);
+        const data = await res.json();
+        
+        if (data.online) {
+            showToast(`🟢 Gateway ${gwIp} đang ONLINE! Liên lạc lần cuối: ${data.last_seen_str || 'vừa xong'}`, "OK");
+            if (currentSelectedToiletData) {
+                currentSelectedToiletData.gateway_online = true;
+                if (currentSelectedToiletData.status === 'OFFLINE') {
+                    currentSelectedToiletData.status = 'OK';
+                }
+                if (currentSelectedToiletData.devices) {
+                    currentSelectedToiletData.devices.forEach(d => {
+                        if (d.status === 'OFFLINE') d.status = 'OK';
+                    });
+                }
+            }
+            if (currentFloorToilets && selectedToiletId) {
+                const curT = currentFloorToilets.find(x => x.id === selectedToiletId);
+                if (curT) {
+                    curT.gateway_online = true;
+                    if (curT.status === 'OFFLINE') curT.status = 'OK';
+                }
+            }
+        } else {
+            showToast(`🔴 Gateway ${gwIp} MẤT KẾT NỐI! ${data.message || 'Không có tín hiệu trong hơn 10 phút'}`, "EMPTY");
+            
+            // Cập nhật trạng thái ngay lập tức trong bộ nhớ
+            if (currentSelectedToiletData) {
+                currentSelectedToiletData.gateway_online = false;
+                currentSelectedToiletData.status = 'OFFLINE';
+                if (currentSelectedToiletData.devices) {
+                    currentSelectedToiletData.devices.forEach(d => {
+                        d.status = 'OFFLINE';
+                    });
+                }
+            }
+            
+            // Cập nhật ngay trong currentFloorToilets
+            if (currentFloorToilets && selectedToiletId) {
+                const curT = currentFloorToilets.find(x => x.id === selectedToiletId);
+                if (curT) {
+                    curT.status = 'OFFLINE';
+                    curT.gateway_online = false;
+                }
+            }
+        }
+
+        // Vẽ lại giao diện Detail Panel ngay lập tức
+        if (currentSelectedToiletData) {
+            renderToiletDetailPanel(currentSelectedToiletData);
+        }
+
+        // Vẽ lại Markers trên canvas bản đồ ngay lập tức
+        renderMarkers();
+
+        // Tải lại chi tiết nhà vệ sinh từ server để đồng bộ hoàn toàn
+        if (selectedToiletId) {
+            await selectToilet(selectedToiletId);
+        }
+        // Đồng bộ danh sách toilets của tầng hiện tại từ server
+        if (currentFloor) {
+            const floorRes = await apiFetch(`/api/floors/${currentFloor.id}`);
+            if (floorRes.ok) {
+                const floorData = await floorRes.json();
+                currentFloorToilets = floorData.toilets || [];
+                renderMarkers();
+            }
+        }
+    } catch (err) {
+        showToast(`Lỗi khi kiểm tra kết nối Gateway: ${err.message}`, "EMPTY");
+    } finally {
+        if (btn) {
+            btn.innerText = originalText;
+            btn.disabled = false;
+        }
     }
 }
 
@@ -1022,7 +1242,12 @@ function handleMapClick(event) {
     pendingPlacementCoords = { x, y };
     document.getElementById('new-toilet-coords').innerText = `${x}, ${y}`;
     document.getElementById('new-toilet-name').value = '';
-    document.getElementById('new-toilet-gw-ip').value = '';
+    const gwInput = document.getElementById('new-toilet-gw-ip');
+    if (assignedGatewayIpForPlacement) {
+        gwInput.value = assignedGatewayIpForPlacement;
+    } else {
+        gwInput.value = '';
+    }
     document.getElementById('modal-add-toilet').style.display = 'flex';
 }
 
@@ -1057,6 +1282,7 @@ async function handleAddToiletSubmit(e) {
 
         closeAddToiletModal();
         togglePlacementMode();
+        assignedGatewayIpForPlacement = null;
         showToast("Đã thêm nhà vệ sinh mới!", "OK");
         await onFloorChanged();
     } catch (err) {
@@ -1087,7 +1313,7 @@ function toggleRepositionToiletMode() {
     } else {
         if (btn) {
             btn.className = 'btn btn-secondary btn-sm';
-            btn.innerText = '🎯 Dời vị trí trên Map';
+            btn.innerText = '🎯 Dời vị trí';
         }
         if (hint) hint.style.display = 'none';
         if (layer) layer.style.cursor = 'default';
@@ -1124,6 +1350,8 @@ function openEditCurrentToiletModal() {
     }
     const gwIp = currentSelectedToiletData.gateway_ip || '';
     document.getElementById('edit-toilet-id').value = currentSelectedToiletData.id;
+    document.getElementById('edit-toilet-floor-id').value = currentFloor ? currentFloor.id : '';
+    document.getElementById('edit-toilet-terminal-id').value = currentFloor ? currentFloor.terminal_id : '';
     document.getElementById('edit-toilet-name').value = currentSelectedToiletData.name;
     document.getElementById('edit-toilet-gw-ip').value = gwIp;
     document.getElementById('edit-toilet-x').value = currentSelectedToiletData.x;
@@ -1212,10 +1440,86 @@ async function handleEditToiletSubmit(e) {
 
         closeEditToiletModal();
         showToast("Đã cập nhật thông tin nhà vệ sinh thành công!", "OK");
-        await onFloorChanged();
-        selectToilet(id);
+        if (currentFloor) await onFloorChanged();
+        if (selectedToiletId) selectToilet(id);
+        if (document.getElementById('view-summary').style.display !== 'none') {
+            await loadSummaryData();
+        }
     } catch (err) {
         alert("Lỗi kết nối khi cập nhật");
+    }
+}
+
+function openEditToiletModalById(id, name, gwIp, x, y, floorId, terminalId) {
+    if (!currentUser || currentUser.role !== 'admin') {
+        showToast("Vui lòng đăng nhập quyền Quản trị viên (Admin) để sửa nhà vệ sinh", "LOW");
+        openLoginModal();
+        return;
+    }
+    const cleanGw = (gwIp && gwIp !== 'None' && gwIp !== 'Chưa gán') ? gwIp : '';
+    document.getElementById('edit-toilet-id').value = id;
+    document.getElementById('edit-toilet-floor-id').value = floorId || (currentFloor ? currentFloor.id : '');
+    document.getElementById('edit-toilet-terminal-id').value = terminalId || (currentFloor ? currentFloor.terminal_id : '');
+    document.getElementById('edit-toilet-name').value = name || '';
+    document.getElementById('edit-toilet-gw-ip').value = cleanGw;
+    document.getElementById('edit-toilet-x').value = (x !== undefined && x !== null) ? x : 0.5;
+    document.getElementById('edit-toilet-y').value = (y !== undefined && y !== null) ? y : 0.5;
+    document.getElementById('modal-edit-toilet').style.display = 'flex';
+    checkDiscoveredClientsForModal(cleanGw);
+}
+
+function handleRepositionFromEditModal() {
+    const toiletId = parseInt(document.getElementById('edit-toilet-id').value);
+    const floorId = parseInt(document.getElementById('edit-toilet-floor-id').value);
+    const termId = parseInt(document.getElementById('edit-toilet-terminal-id').value);
+    closeEditToiletModal();
+
+    if (termId && floorId && toiletId) {
+        jumpToMapToilet(termId, floorId, toiletId, true);
+    } else if (toiletId) {
+        switchView('dashboard');
+        setTimeout(() => {
+            selectToilet(toiletId);
+            setTimeout(() => {
+                if (!isRepositioningToilet) {
+                    toggleRepositionToiletMode();
+                }
+            }, 300);
+        }, 200);
+    } else {
+        switchView('dashboard');
+    }
+}
+
+async function handleDeleteToiletById(toiletId, toiletName) {
+    if (!currentUser || currentUser.role !== 'admin') {
+        showToast("Vui lòng đăng nhập quyền Quản trị viên (Admin) để xoá nhà vệ sinh", "LOW");
+        openLoginModal();
+        return;
+    }
+    if (!confirm(`Bạn có chắc chắn muốn xoá nhà vệ sinh "${toiletName}"? Các liên kết với Gateway và thiết bị sẽ bị huỷ.`)) {
+        return;
+    }
+
+    try {
+        const res = await apiFetch(`/api/admin/toilets/${toiletId}`, { method: 'DELETE' });
+        if (res.ok) {
+            showToast(`Đã xoá nhà vệ sinh "${toiletName}"`, "OK");
+            if (selectedToiletId === toiletId) {
+                document.getElementById('panel-body').style.display = 'none';
+                selectedToiletId = null;
+                currentSelectedToiletData = null;
+            }
+            if (document.getElementById('view-summary').style.display !== 'none') {
+                await loadSummaryData();
+            }
+            if (currentFloor) await onFloorChanged();
+        } else {
+            const err = await res.json();
+            alert(err.detail || "Không thể xoá nhà vệ sinh");
+        }
+    } catch (err) {
+        showToast(`Lỗi khi xoá: ${err.message}`, "EMPTY");
     }
 }
 
@@ -1233,6 +1537,9 @@ async function handleDeleteCurrentToilet() {
             selectedToiletId = null;
             currentSelectedToiletData = null;
             await onFloorChanged();
+            if (document.getElementById('view-summary').style.display !== 'none') {
+                await loadSummaryData();
+            }
         }
     } catch (err) {
         showToast("Lỗi xoá nhà vệ sinh", "EMPTY");
@@ -1273,9 +1580,19 @@ async function loadSummaryData() {
                 <td><span class="status-pill ${item.status}">● ${item.status}</span></td>
                 <td>${item.unack_alerts_count > 0 ? `<span class="badge-alert">${item.unack_alerts_count} cảnh báo</span>` : '0'}</td>
                 <td>
-                    <button class="btn btn-secondary btn-sm" onclick="jumpToMapToilet(${item.terminal_id}, ${item.floor_id}, ${item.id})">
-                        🗺️ Xem trên bản đồ
-                    </button>
+                    <div style="display: flex; gap: 4px; align-items: center; flex-wrap: wrap;">
+                        <button class="btn btn-secondary btn-sm" onclick="jumpToMapToilet(${item.terminal_id}, ${item.floor_id}, ${item.id})" title="Xem trên bản đồ">
+                            🗺️ Xem
+                        </button>
+                        ${(currentUser && currentUser.role === 'admin') ? `
+                            <button class="btn btn-secondary btn-sm" onclick="openEditToiletModalById(${item.id}, '${item.name.replace(/'/g, "\\'")}', '${item.gateway_ip === 'Chưa gán' ? '' : item.gateway_ip}', ${item.x !== undefined ? item.x : 0.5}, ${item.y !== undefined ? item.y : 0.5}, ${item.floor_id}, ${item.terminal_id})" title="Sửa thông tin">
+                                ✏️ Sửa
+                            </button>
+                            <button class="btn btn-danger btn-sm" onclick="handleDeleteToiletById(${item.id}, '${item.name.replace(/'/g, "\\'")}')" title="Xoá nhà vệ sinh">
+                                🗑️ Xoá
+                            </button>
+                        ` : ''}
+                    </div>
                 </td>
             `;
             tbody.appendChild(tr);
@@ -1285,14 +1602,23 @@ async function loadSummaryData() {
     }
 }
 
-function jumpToMapToilet(termId, floorId, toiletId) {
+function jumpToMapToilet(termId, floorId, toiletId, autoReposition = false) {
     switchView('dashboard');
     document.getElementById('sel-terminal').value = termId;
     onTerminalChanged();
     setTimeout(() => {
         document.getElementById('sel-floor').value = floorId;
         onFloorChanged().then(() => {
-            setTimeout(() => selectToilet(toiletId), 400);
+            setTimeout(() => {
+                selectToilet(toiletId);
+                if (autoReposition) {
+                    setTimeout(() => {
+                        if (!isRepositioningToilet) {
+                            toggleRepositionToiletMode();
+                        }
+                    }, 350);
+                }
+            }, 400);
         });
     }, 200);
 }
@@ -1506,6 +1832,13 @@ function switchAdminTab(tabName) {
 
     if (tabName === 'paper') {
         loadAdminPaperSettings();
+    } else if (tabName === 'gateways') {
+        loadAdminGateways();
+        loadAdminDevices();
+    } else if (tabName === 'users') {
+        loadAdminUsers();
+    } else if (tabName === 'maps') {
+        loadAdminMapsOptions();
     }
 }
 
@@ -1885,15 +2218,44 @@ async function loadAdminGateways() {
                 discBadge = `<br><span class="badge-live-pulse" style="margin-top: 3px; font-size: 0.65rem;" title="${discList.map(c => c.mac_address).join(', ')}">📡 +${discList.length} client mới</span>`;
             }
 
+            // Tag CHỜ GÁN nếu Gateway chưa được gán vào Toilet nào (để màu xám)
+            const newTag = gw.is_new 
+                ? `<span style="background: #f1f5f9; color: #475569; border: 1px solid #cbd5e1; padding: 2px 6px; border-radius: 4px; font-size: 0.72rem; font-weight: 600; margin-left: 6px; display: inline-block;">CHỜ GÁN</span>` 
+                : '';
+
+            // Trạng thái: Những gateway KHÔNG ĐƯỢC GÁN vào WC thì để màu xám (⚪)
+            // Chỉ những cái nào ĐÃ GÁN VÀ CÓ TÍN HIỆU ĐANG ĐƯỢC SỬ DỤNG mới để màu xanh (🟢)
+            let statusBadge = '';
+            if (gw.is_new) {
+                // Chưa gán địa chỉ / vị trí -> màu xám
+                statusBadge = gw.is_online
+                    ? `<span style="background: #f8fafc; color: #475569; border: 1px solid #cbd5e1; padding: 2px 8px; border-radius: 9999px; font-size: 0.75rem; font-weight: 600;">⚪ Có tín hiệu (Chưa gán)</span>`
+                    : `<span style="background: #f8fafc; color: #94a3b8; border: 1px solid #e2e8f0; padding: 2px 8px; border-radius: 9999px; font-size: 0.75rem; font-weight: 600;">⚪ Mất kết nối (Chưa gán)</span>`;
+            } else {
+                // Đã gán vào nhà vệ sinh
+                statusBadge = gw.is_online
+                    ? `<span style="background: #dcfce7; color: #15803d; border: 1px solid #86efac; padding: 2px 8px; border-radius: 9999px; font-size: 0.75rem; font-weight: 600;">🟢 Online</span>`
+                    : `<span style="background: #fee2e2; color: #b91c1c; border: 1px solid #fecaca; padding: 2px 8px; border-radius: 9999px; font-size: 0.75rem; font-weight: 600;">🔴 Mất kết nối</span>`;
+            }
+
+            // Nút hành động: Nếu chưa gán toilet thì gợi ý thêm vị trí lên Map
+            const actionBtn = gw.is_new
+                ? `<button class="btn btn-primary btn-sm" style="margin-right: 4px;" onclick="assignGatewayToMap('${gw.ip_address}')">📍 Đặt lên Map</button>`
+                : '';
+
             const tr = document.createElement('tr');
             tr.innerHTML = `
                 <td>${gw.id}</td>
-                <td><strong>${gw.ip_address}</strong></td>
-                <td>${gw.toilet_name}</td>
+                <td><strong>${gw.ip_address}</strong> ${newTag}</td>
+                <td id="gw-status-badge-${gw.id}">${statusBadge}</td>
+                <td><strong style="color: #2563eb;">${gw.terminal_name}</strong></td>
                 <td>${gw.floor_name}</td>
+                <td>${gw.toilet_name}</td>
                 <td>${gw.device_count} ${discBadge}</td>
-                <td>${gw.last_seen ? new Date(gw.last_seen).toLocaleTimeString('vi-VN') : 'Chưa có'}</td>
+                <td id="gw-last-seen-${gw.id}">${gw.last_seen ? new Date(gw.last_seen).toLocaleTimeString('vi-VN') : 'Chưa có'}</td>
                 <td>
+                    ${actionBtn}
+                    <button class="btn btn-secondary btn-sm" id="btn-ping-gw-${gw.id}" style="margin-right: 4px;" onclick="checkAdminGateway('${gw.ip_address}', ${gw.id}, ${gw.is_new ? 'true' : 'false'}, this)" title="Kiểm tra tín hiệu Gateway này">🔍 Kiểm tra</button>
                     <button class="btn btn-danger btn-sm" onclick="handleDeleteGateway(${gw.id})">Xoá</button>
                 </td>
             `;
@@ -1910,6 +2272,72 @@ async function loadAdminGateways() {
             gwSelect.appendChild(opt);
         });
     } catch (err) {}
+}
+
+async function checkAdminGateway(ip, gwId, isNew, btn) {
+    if (!ip) return;
+    const originalText = btn ? btn.innerText : '🔍 Kiểm tra';
+    if (btn) {
+        btn.innerText = '⏳ Đang kiểm tra...';
+        btn.disabled = true;
+    }
+    try {
+        const res = await apiFetch(`/api/admin/gateways/ping?ip=${encodeURIComponent(ip)}`);
+        const data = await res.json();
+        const badgeEl = document.getElementById(`gw-status-badge-${gwId}`);
+        const lastSeenEl = document.getElementById(`gw-last-seen-${gwId}`);
+        if (data.online) {
+            showToast(`🟢 Gateway ${ip} đang ONLINE!`, 'OK');
+            if (badgeEl) {
+                if (isNew) {
+                    badgeEl.innerHTML = `<span style="background: #f8fafc; color: #475569; border: 1px solid #cbd5e1; padding: 2px 8px; border-radius: 9999px; font-size: 0.75rem; font-weight: 600;">⚪ Có tín hiệu (Chưa gán)</span>`;
+                } else {
+                    badgeEl.innerHTML = `<span style="background: #dcfce7; color: #15803d; border: 1px solid #86efac; padding: 2px 8px; border-radius: 9999px; font-size: 0.75rem; font-weight: 600;">🟢 Online</span>`;
+                }
+            }
+        } else {
+            showToast(`🔴 Gateway ${ip} MẤT KẾT NỐI! ${data.message || ''}`, 'EMPTY');
+            if (badgeEl) {
+                if (isNew) {
+                    badgeEl.innerHTML = `<span style="background: #f8fafc; color: #94a3b8; border: 1px solid #e2e8f0; padding: 2px 8px; border-radius: 9999px; font-size: 0.75rem; font-weight: 600;">⚪ Mất kết nối (Chưa gán)</span>`;
+                } else {
+                    badgeEl.innerHTML = `<span style="background: #fee2e2; color: #b91c1c; border: 1px solid #fecaca; padding: 2px 8px; border-radius: 9999px; font-size: 0.75rem; font-weight: 600;">🔴 Mất kết nối</span>`;
+                }
+            }
+        }
+        if (lastSeenEl && data.last_seen) {
+            lastSeenEl.innerText = new Date(data.last_seen).toLocaleTimeString('vi-VN');
+        }
+    } catch (err) {
+        showToast(`Lỗi kiểm tra Gateway: ${err.message}`, 'EMPTY');
+    } finally {
+        if (btn) {
+            btn.innerText = originalText;
+            btn.disabled = false;
+        }
+    }
+}
+
+async function checkAllAdminGateways() {
+    const btn = document.getElementById('btn-ping-all-gw');
+    const originalText = btn ? btn.innerText : '🔍 Kiểm tra tất cả';
+    if (btn) {
+        btn.innerText = '⏳ Đang kiểm tra...';
+        btn.disabled = true;
+    }
+    try {
+        const res = await apiFetch('/api/admin/gateways/ping-all');
+        const data = await res.json();
+        showToast(`Đã kiểm tra xong ${data.total} Gateway: ${data.online_count} Online, ${data.offline_count} Mất kết nối`, data.offline_count > 0 ? 'EMPTY' : 'OK');
+        await loadAdminGateways();
+    } catch (err) {
+        showToast(`Lỗi kiểm tra danh sách Gateway: ${err.message}`, 'EMPTY');
+    } finally {
+        if (btn) {
+            btn.innerText = originalText;
+            btn.disabled = false;
+        }
+    }
 }
 
 async function handleCreateGateway() {
@@ -1940,6 +2368,19 @@ async function handleDeleteGateway(id) {
             loadAdminDevices();
         }
     } catch (err) {}
+}
+
+let assignedGatewayIpForPlacement = null;
+
+function assignGatewayToMap(gatewayIp) {
+    assignedGatewayIpForPlacement = gatewayIp;
+    // Chuyển sang View Bản Đồ Tầng (view-dashboard)
+    switchView('dashboard');
+    // Bật chế độ đặt vị trí trên bản đồ
+    if (!isPlacementMode) {
+        togglePlacementMode();
+    }
+    showToast(`Đã chọn Gateway ${gatewayIp}. Hãy chọn Nhà ga/Tầng và click vào vị trí trên bản đồ!`, "OK");
 }
 
 async function loadAdminDevices() {

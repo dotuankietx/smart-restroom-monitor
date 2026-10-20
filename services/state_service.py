@@ -57,9 +57,30 @@ def evaluate_device_status(paper_level: float, last_seen: Optional[datetime]) ->
     else:
         return "OK"
 
-def evaluate_toilet_status(devices: List[Device]) -> str:
+def evaluate_toilet_status(devices: List[Device], gateway=None) -> str:
+    """
+    Đánh giá trạng thái tổng thể của Nhà vệ sinh:
+    1. Nếu Gateway bị mất kết nối (> 10 phút) -> Toàn bộ Toilet chuyển thành OFFLINE.
+    2. Nếu không có thiết bị -> Trả về OFFLINE nếu Gateway mất kết nối, ngược lại OK.
+    3. Đánh giá theo mức độ nghiêm trọng: EMPTY > LOW > OFFLINE > OK.
+    """
+    from config import GATEWAY_OFFLINE_TIMEOUT_SECONDS
+    now = datetime.now(timezone.utc)
+
+    # 1. Chưa gán Gateway -> Màu xám (OFFLINE)
+    if not gateway:
+        return "OFFLINE"
+
+    # 2. Kiểm tra trạng thái Gateway
+    ls = gateway.last_seen
+    if ls and ls.tzinfo is None:
+        ls = ls.replace(tzinfo=timezone.utc)
+    if ls is None or (now - ls).total_seconds() > GATEWAY_OFFLINE_TIMEOUT_SECONDS:
+        return "OFFLINE"
+
+    # 3. Chưa có thiết bị cảm biến đang sử dụng -> Màu xám (OFFLINE)
     if not devices:
-        return "OK"
+        return "OFFLINE"
     
     statuses = [d.status for d in devices]
     if "EMPTY" in statuses:
@@ -101,16 +122,24 @@ def trigger_alert_if_needed(db: Session, device: Device, new_status: str) -> Opt
     return alert
 
 async def offline_checker_task():
-    """Background task running every 15s to check devices that went offline"""
+    """
+    Background task running every 15s:
+    1. Kiểm tra Client: Nếu không có tín hiệu trong 1 tiếng (3600s) -> Chuyển sang OFFLINE và kích hoạt Alert.
+    2. Kiểm tra Gateway: Nếu sau 10 phút (600s) không gửi báo cáo -> Phát sự kiện GATEWAY_STATUS update.
+    """
+    from config import CLIENT_OFFLINE_TIMEOUT_SECONDS, GATEWAY_OFFLINE_TIMEOUT_SECONDS
+    from models import Gateway
+
     while True:
         try:
             await asyncio.sleep(OFFLINE_CHECK_INTERVAL_SECONDS)
             db: Session = SessionLocal()
             try:
                 now = datetime.now(timezone.utc)
-                cutoff_time = now - timedelta(seconds=OFFLINE_TIMEOUT_SECONDS)
+                client_cutoff = now - timedelta(seconds=CLIENT_OFFLINE_TIMEOUT_SECONDS)
+                gw_cutoff = now - timedelta(seconds=GATEWAY_OFFLINE_TIMEOUT_SECONDS)
                 
-                # Find devices not currently marked OFFLINE whose last_seen is older than cutoff or None
+                # 1. Kiểm tra các thiết bị Client (hơn 1 tiếng không liên lạc)
                 devices = db.query(Device).filter(Device.status != "OFFLINE").all()
                 changed_devices = []
                 new_alerts = []
@@ -120,7 +149,7 @@ async def offline_checker_task():
                     if last_seen and last_seen.tzinfo is None:
                         last_seen = last_seen.replace(tzinfo=timezone.utc)
 
-                    if last_seen is None or last_seen < cutoff_time:
+                    if last_seen is None or last_seen < client_cutoff:
                         dev.status = "OFFLINE"
                         changed_devices.append(dev)
                         
@@ -158,22 +187,41 @@ async def offline_checker_task():
                             }
                         })
 
-                    # Broadcast toilet state updates
-                    affected_toilets = set()
-                    for dev in changed_devices:
-                        if dev.gateway and dev.gateway.toilet:
-                            affected_toilets.add(dev.gateway.toilet)
+                # 2. Kiểm tra các Gateway bị mất kết nối (> 10 phút)
+                gateways = db.query(Gateway).all()
+                affected_toilets = set()
 
-                    for toilet in affected_toilets:
-                        t_status = evaluate_toilet_status(toilet.gateway.devices if toilet.gateway else [])
-                        await manager.broadcast({
-                            "event": "STATE_UPDATE",
-                            "data": {
-                                "toilet_id": toilet.id,
-                                "toilet_name": toilet.name,
-                                "floor_id": toilet.floor_id,
-                                "status": t_status,
-                                "devices": [
+                for gw in gateways:
+                    ls = gw.last_seen
+                    if ls and ls.tzinfo is None:
+                        ls = ls.replace(tzinfo=timezone.utc)
+                    if ls is None or ls < gw_cutoff:
+                        if gw.toilet:
+                            affected_toilets.add(gw.toilet)
+
+                for dev in changed_devices:
+                    if dev.gateway and dev.gateway.toilet:
+                        affected_toilets.add(dev.gateway.toilet)
+
+                for toilet in affected_toilets:
+                    t_status = evaluate_toilet_status(toilet.gateway.devices if toilet.gateway else [], gateway=toilet.gateway)
+                    gw = toilet.gateway
+                    gw_is_online = False
+                    if gw and gw.last_seen:
+                        ls_gw = gw.last_seen.replace(tzinfo=timezone.utc) if gw.last_seen.tzinfo is None else gw.last_seen
+                        gw_is_online = (now - ls_gw).total_seconds() <= GATEWAY_OFFLINE_TIMEOUT_SECONDS
+
+                    await manager.broadcast({
+                        "event": "STATE_UPDATE",
+                        "data": {
+                            "toilet_id": toilet.id,
+                            "toilet_name": toilet.name,
+                            "floor_id": toilet.floor_id,
+                            "status": t_status,
+                            "gateway_id": gw.id if gw else None,
+                            "gateway_ip": gw.ip_address if gw else None,
+                            "gateway_online": gw_is_online,
+                            "devices": [
                                     {
                                         "id": d.id,
                                         "mac_address": d.mac_address,
@@ -181,7 +229,7 @@ async def offline_checker_task():
                                         "label": d.label,
                                         "paper_level": d.paper_level,
                                         "battery": d.battery,
-                                        "status": d.status,
+                                        "status": "OFFLINE" if not gw_is_online else d.status,
                                         "last_seen": d.last_seen.isoformat() if d.last_seen else None
                                     }
                                     for d in sorted(toilet.gateway.devices if toilet.gateway else [], key=lambda x: (x.cabin_order if x.cabin_order is not None else 999, x.id))

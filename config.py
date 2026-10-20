@@ -17,7 +17,15 @@ GATEWAY_API_KEY = os.getenv("GATEWAY_API_KEY", "airport-gateway-secret-api-key-2
 # Thresholds & Timeouts
 PAPER_THRESHOLD_OK = 30     # > 30 is OK
 PAPER_THRESHOLD_LOW = 10    # 10 < paper <= 30 is LOW, <= 10 is EMPTY
-OFFLINE_TIMEOUT_SECONDS = int(os.getenv("OFFLINE_TIMEOUT_SECONDS", "120"))
+
+# Gateway gửi tín hiệu 5 phút/lần, sau 10 phút (600 giây) không kết nối thì coi là MẤT KẾT NỐI (OFFLINE)
+GATEWAY_OFFLINE_TIMEOUT_SECONDS = int(os.getenv("GATEWAY_OFFLINE_TIMEOUT_SECONDS", "600"))
+
+# Client (Node cảm biến trong buồng vệ sinh) sau 1 tiếng (3600 giây) không gửi tín hiệu thì OFFLINE
+CLIENT_OFFLINE_TIMEOUT_SECONDS = int(os.getenv("CLIENT_OFFLINE_TIMEOUT_SECONDS", "3600"))
+
+# Giữ biến cũ để tương thích
+OFFLINE_TIMEOUT_SECONDS = CLIENT_OFFLINE_TIMEOUT_SECONDS
 OFFLINE_CHECK_INTERVAL_SECONDS = int(os.getenv("OFFLINE_CHECK_INTERVAL_SECONDS", "15"))
 
 # Cấu hình quy đổi khoảng cách cảm biến ToF (VL53L0X) mm -> phần trăm giấy (%)

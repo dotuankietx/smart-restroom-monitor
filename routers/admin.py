@@ -1,6 +1,7 @@
 import os
 import shutil
 import time
+from datetime import datetime, timezone, timedelta
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, status
 from sqlalchemy.orm import Session
@@ -242,18 +243,308 @@ def delete_toilet(toilet_id: int, db: Session = Depends(get_db)):
 @router.get("/gateways")
 def list_gateways(db: Session = Depends(get_db)):
     gateways = db.query(Gateway).all()
+    now = datetime.now(timezone.utc)
     results = []
+    from config import GATEWAY_OFFLINE_TIMEOUT_SECONDS
     for gw in gateways:
+        ls = gw.last_seen
+        if ls and ls.tzinfo is None:
+            ls = ls.replace(tzinfo=timezone.utc)
+        
+        diff_sec = (now - ls).total_seconds() if ls else 999999
+        is_online = (diff_sec <= GATEWAY_OFFLINE_TIMEOUT_SECONDS)
+        # Gateway được coi là "MỚI" nếu chưa được gán vào Toilet nào (toilet_id is None)
+        is_new = (gw.toilet_id is None)
+
+        toilet = gw.toilet
+        floor = toilet.floor if toilet else None
+        terminal = floor.terminal if floor else None
+
         results.append({
             "id": gw.id,
             "ip_address": gw.ip_address,
-            "toilet_id": gw.toilet.id if gw.toilet else None,
-            "toilet_name": gw.toilet.name if gw.toilet else "Chưa gán",
-            "floor_name": gw.toilet.floor.name if (gw.toilet and gw.toilet.floor) else "—",
+            "toilet_id": toilet.id if toilet else None,
+            "toilet_name": toilet.name if toilet else "Chưa gán",
+            "terminal_name": terminal.name if terminal else "—",
+            "floor_name": floor.name if floor else "—",
             "last_seen": gw.last_seen.isoformat() if gw.last_seen else None,
-            "device_count": len(gw.devices)
+            "device_count": len(gw.devices),
+            "is_new": is_new,
+            "is_online": is_online,
+            "status": "ONLINE" if is_online else "OFFLINE"
         })
     return results
+
+@router.get("/gateways/ping")
+async def ping_gateway(ip: str, db: Session = Depends(get_db)):
+    """
+    Kiểm tra trạng thái kết nối của Gateway dựa trên:
+    1. Thời gian nhận gói tin lần cuối (last_seen) trong CSDL (offline nếu > 10 phút)
+    2. Độ trễ hoặc thời gian trôi qua kể từ lần liên lạc gần nhất
+    """
+    clean_ip = ip.strip()
+    gw = db.query(Gateway).filter(Gateway.ip_address == clean_ip).first()
+    if not gw:
+        raise HTTPException(status_code=404, detail=f"Không tìm thấy Gateway với IP {clean_ip}")
+
+    now = datetime.now(timezone.utc)
+    from config import GATEWAY_OFFLINE_TIMEOUT_SECONDS
+
+    ls = gw.last_seen
+    if ls and ls.tzinfo is None:
+        ls = ls.replace(tzinfo=timezone.utc)
+
+    if not ls:
+        return {
+            "gateway_ip": clean_ip,
+            "online": False,
+            "elapsed_seconds": None,
+            "message": "Gateway chưa từng gửi bất kỳ gói tin nào về Server."
+        }
+
+    elapsed = (now - ls).total_seconds()
+    is_online = (elapsed <= GATEWAY_OFFLINE_TIMEOUT_SECONDS)
+
+    # 1. Thử gửi gói ping ICMP thực tế đến IP của Gateway (thời gian chờ 1.2 giây)
+    import subprocess, platform
+    is_reachable = False
+    try:
+        param = "-n 1 -w 1200" if platform.system().lower() == "windows" else "-c 1 -W 1"
+        res = subprocess.run(f"ping {param} {clean_ip}", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, shell=True)
+        is_reachable = (res.returncode == 0)
+    except Exception:
+        is_reachable = False
+
+    last_seen_str = ls.strftime("%H:%M:%S %d/%m/%Y")
+    minutes_ago = int(elapsed // 60)
+    seconds_ago = int(elapsed % 60)
+
+    # Nếu vừa ping ICMP được HOẶC vừa mới gửi gói tin trong vòng 10 phút
+    # Nhưng nếu ping thực tế thất bại VÀ người dùng chủ động bấm kiểm tra:
+    # Nếu IP cục bộ không ping được (mất nguồn) -> Báo ngay là Mất kết nối!
+    final_online = is_reachable or (is_online and not clean_ip.startswith("192.168."))
+
+    if not is_reachable and (clean_ip.startswith("192.168.") or clean_ip.startswith("10.") or clean_ip.startswith("172.")):
+        final_online = False
+        msg = f"Đã mất kết nối vật lý (Thiết bị không phản hồi, đã tắt nguồn hoặc rớt Wi-Fi. Lần liên lạc cuối: {last_seen_str})"
+        # Cập nhật thời gian last_seen lùi về quá 10 phút trước để CSDL và toàn bộ hệ thống (Map, WS) đều coi Gateway là OFFLINE
+        gw.last_seen = now - timedelta(seconds=GATEWAY_OFFLINE_TIMEOUT_SECONDS + 10)
+        for d in gw.devices:
+            d.status = "OFFLINE"
+        db.commit()
+
+        # Phát sóng WebSocket cập nhật ngay lập tức trạng thái Toilet
+        if gw.toilet:
+            from services.state_service import evaluate_toilet_status, manager
+            t_status = evaluate_toilet_status(gw.devices, gateway=gw)
+            await manager.broadcast({
+                "event": "STATE_UPDATE",
+                "data": {
+                    "toilet_id": gw.toilet.id,
+                    "toilet_name": gw.toilet.name,
+                    "floor_id": gw.toilet.floor_id,
+                    "status": t_status,
+                    "gateway_id": gw.id,
+                    "gateway_ip": gw.ip_address,
+                    "gateway_online": False,
+                    "devices": [
+                        {
+                            "id": d.id,
+                            "mac_address": d.mac_address,
+                            "cabin_order": d.cabin_order if d.cabin_order is not None else 1,
+                            "label": d.label,
+                            "paper_level": d.paper_level,
+                            "battery": d.battery,
+                            "status": "OFFLINE",
+                            "last_seen": d.last_seen.isoformat() if d.last_seen else None
+                        } for d in gw.devices
+                    ]
+                }
+            })
+    elif is_reachable:
+        final_online = True
+        msg = f"Đang phản hồi tín hiệu tốt! (Ping mạng OK, dữ liệu gần nhất: {minutes_ago}p {seconds_ago}s trước)"
+        gw.last_seen = now
+        from services.state_service import evaluate_device_status, evaluate_toilet_status, manager
+        for d in gw.devices:
+            d.status = evaluate_device_status(d.paper_level, d.last_seen)
+        db.commit()
+        last_seen_str = now.strftime("%H:%M:%S %d/%m/%Y")
+        ls = now
+        elapsed = 0
+
+        if gw.toilet:
+            t_status = evaluate_toilet_status(gw.devices, gateway=gw)
+            await manager.broadcast({
+                "event": "STATE_UPDATE",
+                "data": {
+                    "toilet_id": gw.toilet.id,
+                    "toilet_name": gw.toilet.name,
+                    "floor_id": gw.toilet.floor_id,
+                    "status": t_status,
+                    "gateway_id": gw.id,
+                    "gateway_ip": gw.ip_address,
+                    "gateway_online": True,
+                    "devices": [
+                        {
+                            "id": d.id,
+                            "mac_address": d.mac_address,
+                            "cabin_order": d.cabin_order if d.cabin_order is not None else 1,
+                            "label": d.label,
+                            "paper_level": d.paper_level,
+                            "battery": d.battery,
+                            "status": d.status,
+                            "last_seen": d.last_seen.isoformat() if d.last_seen else None
+                        } for d in gw.devices
+                    ]
+                }
+            })
+    elif is_online:
+        final_online = True
+        msg = f"Đang hoạt động tốt (Gói tin gần nhất: {minutes_ago}p {seconds_ago}s trước)"
+        from services.state_service import evaluate_device_status, evaluate_toilet_status, manager
+        for d in gw.devices:
+            d.status = evaluate_device_status(d.paper_level, d.last_seen)
+        db.commit()
+        if gw.toilet:
+            t_status = evaluate_toilet_status(gw.devices, gateway=gw)
+            await manager.broadcast({
+                "event": "STATE_UPDATE",
+                "data": {
+                    "toilet_id": gw.toilet.id,
+                    "toilet_name": gw.toilet.name,
+                    "floor_id": gw.toilet.floor_id,
+                    "status": t_status,
+                    "gateway_id": gw.id,
+                    "gateway_ip": gw.ip_address,
+                    "gateway_online": True,
+                    "devices": [
+                        {
+                            "id": d.id,
+                            "mac_address": d.mac_address,
+                            "cabin_order": d.cabin_order if d.cabin_order is not None else 1,
+                            "label": d.label,
+                            "paper_level": d.paper_level,
+                            "battery": d.battery,
+                            "status": d.status,
+                            "last_seen": d.last_seen.isoformat() if d.last_seen else None
+                        } for d in gw.devices
+                    ]
+                }
+            })
+    else:
+        final_online = False
+        msg = f"Đã mất kết nối trong {minutes_ago} phút qua (Lần cuối: {last_seen_str})"
+
+    return {
+        "gateway_ip": clean_ip,
+        "online": final_online,
+        "ping_ok": is_reachable,
+        "elapsed_seconds": round(elapsed, 1),
+        "last_seen": ls.isoformat(),
+        "last_seen_str": last_seen_str,
+        "message": msg
+    }
+
+@router.get("/gateways/ping-all")
+async def ping_all_gateways(db: Session = Depends(get_db)):
+    """
+    Kiểm tra trạng thái kết nối của TẤT CẢ các Gateway trong hệ thống cùng lúc.
+    """
+    gateways = db.query(Gateway).all()
+    results = []
+    online_count = 0
+    offline_count = 0
+    now = datetime.now(timezone.utc)
+    from config import GATEWAY_OFFLINE_TIMEOUT_SECONDS
+    import subprocess, platform
+
+    for gw in gateways:
+        clean_ip = gw.ip_address.strip() if gw.ip_address else ""
+        ls = gw.last_seen
+        if ls and ls.tzinfo is None:
+            ls = ls.replace(tzinfo=timezone.utc)
+
+        elapsed = (now - ls).total_seconds() if ls else 999999
+        is_online = (elapsed <= GATEWAY_OFFLINE_TIMEOUT_SECONDS)
+
+        is_reachable = False
+        if clean_ip:
+            try:
+                param = "-n 1 -w 1000" if platform.system().lower() == "windows" else "-c 1 -W 1"
+                res = subprocess.run(f"ping {param} {clean_ip}", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, shell=True)
+                is_reachable = (res.returncode == 0)
+            except Exception:
+                is_reachable = False
+
+        if not is_reachable and (clean_ip.startswith("192.168.") or clean_ip.startswith("10.") or clean_ip.startswith("172.")):
+            final_online = False
+            gw.last_seen = now - timedelta(seconds=GATEWAY_OFFLINE_TIMEOUT_SECONDS + 10)
+            for d in gw.devices:
+                d.status = "OFFLINE"
+            offline_count += 1
+        elif is_reachable or is_online:
+            final_online = True
+            online_count += 1
+            if is_reachable:
+                gw.last_seen = now
+            from services.state_service import evaluate_device_status
+            for d in gw.devices:
+                d.status = evaluate_device_status(d.paper_level, d.last_seen)
+        else:
+            final_online = False
+            offline_count += 1
+
+        results.append({
+            "id": gw.id,
+            "ip_address": clean_ip,
+            "online": final_online,
+            "ping_ok": is_reachable,
+            "last_seen": gw.last_seen.isoformat() if gw.last_seen else None
+        })
+
+    db.commit()
+
+    # Phát sóng cập nhật trạng thái nếu có thay đổi
+    from services.state_service import evaluate_toilet_status, manager
+    for gw in gateways:
+        if gw.toilet:
+            t_status = evaluate_toilet_status(gw.devices, gateway=gw)
+            gw_online_status = False
+            if gw.last_seen:
+                ls_t = gw.last_seen.replace(tzinfo=timezone.utc) if gw.last_seen.tzinfo is None else gw.last_seen
+                gw_online_status = (now - ls_t).total_seconds() <= GATEWAY_OFFLINE_TIMEOUT_SECONDS
+            await manager.broadcast({
+                "event": "STATE_UPDATE",
+                "data": {
+                    "toilet_id": gw.toilet.id,
+                    "toilet_name": gw.toilet.name,
+                    "floor_id": gw.toilet.floor_id,
+                    "status": t_status,
+                    "gateway_id": gw.id,
+                    "gateway_ip": gw.ip_address,
+                    "gateway_online": gw_online_status,
+                    "devices": [
+                        {
+                            "id": d.id,
+                            "mac_address": d.mac_address,
+                            "cabin_order": d.cabin_order if d.cabin_order is not None else 1,
+                            "label": d.label,
+                            "paper_level": d.paper_level,
+                            "battery": d.battery,
+                            "status": "OFFLINE" if not gw_online_status else d.status,
+                            "last_seen": d.last_seen.isoformat() if d.last_seen else None
+                        } for d in gw.devices
+                    ]
+                }
+            })
+
+    return {
+        "total": len(gateways),
+        "online_count": online_count,
+        "offline_count": offline_count,
+        "results": results
+    }
 
 @router.post("/gateways")
 def create_gateway(ip_address: str, db: Session = Depends(get_db)):

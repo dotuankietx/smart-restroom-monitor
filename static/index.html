@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Hệ Thống Giám Sát Giấy Vệ Sinh Sân Bay</title>
-    <link rel="stylesheet" href="/static/css/style.css">
+    <link rel="stylesheet" href="/static/css/style.css?v=20261019_v16">
     <!-- PDF.js CDN -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
     <!-- Chart.js CDN -->
@@ -24,16 +24,16 @@
 
         <nav class="nav-links" id="main-nav">
             <button class="nav-item active" onclick="switchView('dashboard')">
-                🗺️ Bản đồ tầng
+                🗺️ Bản đồ
             </button>
             <button class="nav-item" onclick="switchView('summary')">
-                📊 Tổng hợp toàn cảng
+                📊 Tổng hợp
             </button>
             <button class="nav-item" onclick="switchView('alerts')">
                 🔔 Cảnh báo <span id="unack-alerts-badge" class="badge-alert" style="display: none;">0</span>
             </button>
             <button class="nav-item" id="nav-admin" onclick="switchView('admin')" style="display: none;">
-                ⚙️ Quản trị hệ thống
+                ⚙️ Quản trị
             </button>
         </nav>
 
@@ -43,11 +43,24 @@
                 <span id="ws-text">Đang kết nối...</span>
             </div>
 
-            <div class="user-profile" id="user-profile-box" style="display: none;">
-                <span id="display-username" style="font-weight: 600;">admin</span>
-                <span id="display-role" class="role-badge admin">ADMIN</span>
-                <button class="btn btn-secondary btn-sm" onclick="openChangePasswordModal()" title="Đổi mật khẩu">🔑</button>
-                <button class="btn btn-danger btn-sm" onclick="handleLogout()">Đăng xuất</button>
+            <div class="user-dropdown-container" id="user-profile-box" style="display: none;">
+                <button type="button" class="user-dropdown-btn" id="btn-user-dropdown" onclick="toggleUserDropdown(event)" title="Tuỳ chọn tài khoản">
+                    <span style="font-size: 0.95rem;">👤</span>
+                    <span id="display-username" style="font-weight: 600;">admin</span>
+                    <span id="display-role" class="role-badge admin">ADMIN</span>
+                    <span class="user-dropdown-arrow" id="user-dropdown-arrow">▼</span>
+                </button>
+                <div class="user-dropdown-menu" id="user-dropdown-menu" style="display: none;">
+                    <button type="button" class="user-dropdown-item" onclick="openChangePasswordModal(); closeUserDropdown();">
+                        <span>🔑</span>
+                        <span>Đổi mật khẩu</span>
+                    </button>
+                    <div class="user-dropdown-divider"></div>
+                    <button type="button" class="user-dropdown-item danger" onclick="handleLogout(); closeUserDropdown();">
+                        <span>🚪</span>
+                        <span>Đăng xuất</span>
+                    </button>
+                </div>
             </div>
             <button class="btn btn-primary btn-sm" id="btn-login-open" onclick="openLoginModal()">Đăng nhập</button>
         </div>
@@ -126,9 +139,15 @@
                     </div>
 
                     <div id="panel-body" style="display: none;">
-                        <div style="font-size: 0.825rem; margin-bottom: 0.75rem; color: var(--text-secondary); display: flex; justify-content: space-between; align-items: center;">
-                            <div><strong>Gateway IP:</strong> <span id="panel-gw-ip">Chưa gán</span></div>
-                            <div style="font-size: 0.75rem; color: var(--text-muted);">Toạ độ: <span id="panel-coords">--</span></div>
+                        <div style="font-size: 0.825rem; margin-bottom: 0.75rem; color: var(--text-secondary); display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.5rem; background: #f8fafc; padding: 6px 10px; border-radius: 6px; border: 1px solid #e2e8f0;">
+                            <div>
+                                <strong>Gateway:</strong> <span id="panel-gw-ip">Chưa gán</span>
+                                <span id="panel-gw-status" style="margin-left: 6px; font-size: 0.75rem;"></span>
+                            </div>
+                            <div style="display: flex; gap: 0.5rem; align-items: center;">
+                                <button class="btn btn-secondary btn-sm" id="btn-ping-gw" style="padding: 2px 8px; font-size: 0.75rem;" onclick="checkCurrentGatewayConnection()">🔍 Kiểm tra kết nối</button>
+                                <span style="font-size: 0.75rem; color: var(--text-muted);">Toạ độ: <span id="panel-coords">--</span></span>
+                            </div>
                         </div>
 
                         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
@@ -149,9 +168,9 @@
                         </div>
 
                         <div id="admin-toilet-actions" style="margin-top: 1rem; display: none; gap: 0.5rem; flex-wrap: wrap;">
-                            <button class="btn btn-secondary btn-sm" id="btn-reposition-toilet" onclick="toggleRepositionToiletMode()">🎯 Dời vị trí trên Map</button>
-                            <button class="btn btn-secondary btn-sm" onclick="openEditCurrentToiletModal()">✏️ Sửa thông tin</button>
-                            <button class="btn btn-danger btn-sm" onclick="handleDeleteCurrentToilet()">🗑️ Xoá Toilet</button>
+                            <button class="btn btn-secondary btn-sm" id="btn-reposition-toilet" onclick="toggleRepositionToiletMode()">🎯 Dời vị trí</button>
+                            <button class="btn btn-secondary btn-sm" onclick="openEditCurrentToiletModal()">✏️ Sửa</button>
+                            <button class="btn btn-danger btn-sm" onclick="handleDeleteCurrentToilet()">🗑️ Xoá</button>
                         </div>
                     </div>
                 </div>
@@ -299,7 +318,8 @@
                 <div style="margin-bottom: 1.5rem;">
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.75rem;">
                         <h3>Danh sách Gateway</h3>
-                        <div style="display: flex; gap: 0.5rem;">
+                        <div style="display: flex; gap: 0.5rem; flex-wrap: wrap;">
+                            <button class="btn btn-secondary btn-sm" id="btn-ping-all-gw" onclick="checkAllAdminGateways()" title="Kiểm tra kết nối tất cả Gateway">🔍 Kiểm tra tất cả</button>
                             <input type="text" id="new-gw-ip" placeholder="Nhập IP Gateway (vd: 192.168.1.50)">
                             <button class="btn btn-primary btn-sm" onclick="handleCreateGateway()">Thêm Gateway</button>
                         </div>
@@ -310,10 +330,12 @@
                                 <tr>
                                     <th>ID</th>
                                     <th>IP Gateway</th>
-                                    <th>Gán cho WC</th>
+                                    <th>Trạng thái</th>
+                                    <th>Nhà ga</th>
                                     <th>Vị trí tầng</th>
+                                    <th>Gán cho WC</th>
                                     <th>Số thiết bị</th>
-                                    <th>Last Seen</th>
+                                    <th>Lần cuối liên lạc</th>
                                     <th>Thao tác</th>
                                 </tr>
                             </thead>
@@ -768,6 +790,8 @@
             </div>
             <form onsubmit="handleEditToiletSubmit(event)">
                 <input type="hidden" id="edit-toilet-id">
+                <input type="hidden" id="edit-toilet-floor-id">
+                <input type="hidden" id="edit-toilet-terminal-id">
                 <div class="modal-body">
                     <div class="form-group">
                         <label>Tên nhà vệ sinh:</label>
@@ -788,8 +812,13 @@
                             <input type="number" id="edit-toilet-y" step="0.001" min="0" max="1" required>
                         </div>
                     </div>
-                    <div style="font-size: 0.8rem; color: var(--text-secondary);">
-                        💡 Mẹo: Bạn có thể kéo thả trực tiếp biểu tượng trên bản đồ hoặc bấm "🎯 Dời vị trí trên Map" để chọn toạ độ mới nhanh chóng.
+                    <div style="margin-top: 0.25rem; margin-bottom: 0.75rem;">
+                        <button type="button" class="btn btn-secondary" onclick="handleRepositionFromEditModal()" style="width: 100%; display: flex; align-items: center; justify-content: center; gap: 6px; font-weight: 600; padding: 0.6rem;">
+                            🎯 Dời vị trí trên bản đồ
+                        </button>
+                    </div>
+                    <div style="font-size: 0.8rem; color: var(--text-secondary); line-height: 1.4;">
+                        💡 <strong>Mẹo:</strong> Bấm <strong>"🎯 Dời vị trí trên bản đồ"</strong> ở trên để chuyển sang bản đồ và chọn toạ độ mới nhanh chóng.
                     </div>
                 </div>
                 <div class="modal-footer">
@@ -849,6 +878,6 @@
         }
     };
     </script>
-    <script src="/static/js/app.js?v=20261009_v7"></script>
+    <script src="/static/js/app.js?v=20261019_v17"></script>
 </body>
 </html>

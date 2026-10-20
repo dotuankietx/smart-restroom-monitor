@@ -34,42 +34,22 @@ async def receive_gateway_report(
     effective_ip = payload.gateway_ip.strip() if payload.gateway_ip else (request.client.host if request.client else "127.0.0.1")
     print(f"[Gateway API] Received report from IP: {effective_ip} with {len(payload.devices)} devices")
 
-    # Find registered gateway, or auto-register if new
+    # Find registered gateway, or auto-register if new (WITHOUT auto-creating toilet on map)
     gateway = db.query(Gateway).filter(Gateway.ip_address == effective_ip).first()
     if not gateway:
-        print(f"[Gateway API] Gateway IP {effective_ip} is not yet registered. Auto-registering Gateway...")
-        # Find first toilet that doesn't have a gateway, or create a new toilet
-        assigned_toilet = db.query(Toilet).filter(Toilet.gateway_id == None).first()
-        if not assigned_toilet:
-            from models import Floor
-            first_floor = db.query(Floor).first()
-            if first_floor:
-                assigned_toilet = Toilet(
-                    floor_id=first_floor.id,
-                    name=f"Toilet GW-{effective_ip.replace('.', '_')}",
-                    x=0.5,
-                    y=0.5
-                )
-                db.add(assigned_toilet)
-                db.flush()
-
-        if assigned_toilet:
-            # Unlink any stray gateways pointing to this toilet to preserve unique constraint
-            for stray in db.query(Gateway).filter(Gateway.toilet_id == assigned_toilet.id).all():
-                stray.toilet_id = None
-            db.flush()
-
+        print(f"[Gateway API] Gateway IP {effective_ip} is new. Registering Gateway as unassigned...")
+        # [CODE CU]: Tu dong tao Toilet va ghim len ban do tang
+        # assigned_toilet = db.query(Toilet).filter(Toilet.gateway_id == None).first()
+        # ...
+        # [CODE MOI]: Chi tao Gateway trong CSDL voi toilet_id = None. Nguoi dung se tu them Toilet len map sau!
         gateway = Gateway(
             ip_address=effective_ip,
-            toilet_id=assigned_toilet.id if assigned_toilet else None,
+            toilet_id=None,
             last_seen=datetime.now(timezone.utc)
         )
         db.add(gateway)
         db.flush()
-        if assigned_toilet:
-            assigned_toilet.gateway_id = gateway.id
-            db.flush()
-        print(f"[Gateway API] Successfully registered Gateway #{gateway.id} (IP: {effective_ip})")
+        print(f"[Gateway API] Successfully registered new Gateway #{gateway.id} (IP: {effective_ip}) - Unassigned Toilet")
 
     now = datetime.now(timezone.utc)
     gateway.last_seen = now
@@ -193,6 +173,9 @@ async def receive_gateway_report(
                 "toilet_name": toilet.name,
                 "floor_id": toilet.floor_id,
                 "status": t_status,
+                "gateway_id": gateway.id,
+                "gateway_ip": effective_ip,
+                "gateway_online": True,
                 "devices": dev_list,
                 "discovered_devices": unsaved_discovered
             }

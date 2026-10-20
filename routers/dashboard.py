@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
@@ -64,10 +65,18 @@ def get_floor_details(
         raise HTTPException(status_code=404, detail="Không tìm thấy tầng được yêu cầu")
 
     toilets_data = []
+    now = datetime.now(timezone.utc)
+    from config import GATEWAY_OFFLINE_TIMEOUT_SECONDS
     for t in floor.toilets:
         devices = t.gateway.devices if t.gateway else []
-        t_status = evaluate_toilet_status(devices)
+        t_status = evaluate_toilet_status(devices, gateway=t.gateway)
         min_paper = min([d.paper_level for d in devices]) if devices else 100.0
+
+        gw = t.gateway
+        gw_online = False
+        if gw and gw.last_seen:
+            ls = gw.last_seen.replace(tzinfo=timezone.utc) if gw.last_seen.tzinfo is None else gw.last_seen
+            gw_online = (now - ls).total_seconds() <= GATEWAY_OFFLINE_TIMEOUT_SECONDS
 
         toilets_data.append({
             "id": t.id,
@@ -76,8 +85,10 @@ def get_floor_details(
             "y": t.y,
             "status": t_status,
             "min_paper": min_paper,
-            "gateway_id": t.gateway.id if t.gateway else None,
-            "gateway_ip": t.gateway.ip_address if t.gateway else None,
+            "gateway_id": gw.id if gw else None,
+            "gateway_ip": gw.ip_address if gw else None,
+            "gateway_online": gw_online,
+            "gateway_last_seen": gw.last_seen.isoformat() if (gw and gw.last_seen) else None,
             "device_count": len(devices)
         })
 
@@ -102,9 +113,19 @@ def get_toilet_detail(
 
     devices = toilet.gateway.devices if toilet.gateway else []
     sorted_devices = sorted(devices, key=lambda d: (d.cabin_order if d.cabin_order is not None else 999, d.id))
-    t_status = evaluate_toilet_status(devices)
+    t_status = evaluate_toilet_status(devices, gateway=toilet.gateway)
 
-    gw_ip = toilet.gateway.ip_address if toilet.gateway else None
+    gw = toilet.gateway
+    gw_ip = gw.ip_address if gw else None
+    gw_online = False
+    gw_last_seen = None
+    if gw and gw.last_seen:
+        now = datetime.now(timezone.utc)
+        ls = gw.last_seen.replace(tzinfo=timezone.utc) if gw.last_seen.tzinfo is None else gw.last_seen
+        from config import GATEWAY_OFFLINE_TIMEOUT_SECONDS
+        gw_online = (now - ls).total_seconds() <= GATEWAY_OFFLINE_TIMEOUT_SECONDS
+        gw_last_seen = gw.last_seen.isoformat()
+
     from services.discovery_service import discovery_service
     discovered = []
     if gw_ip:
@@ -126,7 +147,7 @@ def get_toilet_detail(
             "remaining_thickness_mm": m["remaining_thickness_mm"],
             "estimated_uses": m["estimated_uses"],
             "battery": d.battery,
-            "status": d.status,
+            "status": "OFFLINE" if not gw_online else d.status,
             "last_seen": d.last_seen.isoformat() if d.last_seen else None
         })
 
@@ -138,8 +159,10 @@ def get_toilet_detail(
         "terminal_name": toilet.floor.terminal.name,
         "x": toilet.x,
         "y": toilet.y,
-        "gateway_id": toilet.gateway.id if toilet.gateway else None,
+        "gateway_id": gw.id if gw else None,
         "gateway_ip": gw_ip,
+        "gateway_online": gw_online,
+        "gateway_last_seen": gw_last_seen,
         "status": t_status,
         "devices": devices_list,
         "discovered_devices": discovered
@@ -195,7 +218,7 @@ def get_airport_summary(
 
     for t in toilets:
         devices = t.gateway.devices if t.gateway else []
-        t_status = evaluate_toilet_status(devices)
+        t_status = evaluate_toilet_status(devices, gateway=t.gateway)
 
         if status_filter and status_filter.upper() != "ALL" and t_status != status_filter.upper():
             continue
@@ -221,7 +244,9 @@ def get_airport_summary(
             "status": t_status,
             "min_paper": min_paper,
             "unack_alerts_count": unack_alerts_count,
-            "severity": severity_order.get(t_status, 4)
+            "severity": severity_order.get(t_status, 4),
+            "x": t.x,
+            "y": t.y
         })
 
     # Sort primarily by severity (EMPTY first), then by terminal and name
