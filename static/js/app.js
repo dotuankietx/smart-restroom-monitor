@@ -1,4 +1,15 @@
 // ================= GLOBAL STATE & CONFIG =================
+
+function escapeHtml(str) {
+    if (str === null || str === undefined) return '';
+    return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
 let currentUser = null;
 let currentTerminals = [];
 let currentFloor = null;
@@ -6,6 +17,7 @@ let currentFloorToilets = [];
 let selectedToiletId = null;
 let currentPdfDoc = null;
 let currentPdfPage = null;
+let currentMapImage = null;
 let basePdfScale = 1.0;
 let currentZoomLevel = 1.0;
 let isRenderingPdf = false;
@@ -34,6 +46,9 @@ function setToken(token) {
     }
 }
 
+let isLoggingOut = false;
+let lastSessionExpiredNoticeTime = 0;
+
 async function apiFetch(url, options = {}) {
     const headers = options.headers || {};
     const token = getToken();
@@ -49,12 +64,20 @@ async function apiFetch(url, options = {}) {
         const response = await fetch(url, options);
         if (response.status === 401) {
             // Unauthorized / expired
+            const hadUser = (currentUser !== null) || (getToken() !== null);
             setToken(null);
             currentUser = null;
             updateUserUI();
-            if (!url.includes('/api/auth/me')) {
-                showToast("Phiên làm việc đã hết hạn. Vui lòng đăng nhập lại.", "OFFLINE");
-                openLoginModal();
+
+            const isAuthRoute = url.includes('/api/auth/me') || url.includes('/api/auth/logout') || url.includes('/api/auth/login');
+            if (hadUser && !isLoggingOut && !isAuthRoute) {
+                const now = Date.now();
+                // Throttle notification: at most once every 10 seconds to prevent alert storms
+                if (now - lastSessionExpiredNoticeTime > 10000) {
+                    lastSessionExpiredNoticeTime = now;
+                    showToast("Phiên làm việc đã hết hạn. Vui lòng đăng nhập lại.", "OFFLINE");
+                    openLoginModal();
+                }
             }
             throw new Error("Unauthorized");
         }
@@ -138,12 +161,16 @@ function updateUserUI() {
             if (adminToiletActions) adminToiletActions.style.display = 'flex';
             if (addCabinBtn) addCabinBtn.style.display = 'inline-flex';
             if (editToiletBtn) editToiletBtn.style.display = 'inline-block';
+            const paperWrap = document.getElementById('panel-toilet-paper-wrap');
+            if (paperWrap && selectedToiletId) paperWrap.style.display = 'flex';
         } else {
             adminNav.style.display = 'none';
             if (adminMapTools) adminMapTools.style.display = 'none';
             if (adminToiletActions) adminToiletActions.style.display = 'none';
             if (addCabinBtn) addCabinBtn.style.display = 'none';
             if (editToiletBtn) editToiletBtn.style.display = 'none';
+            const paperWrap = document.getElementById('panel-toilet-paper-wrap');
+            if (paperWrap) paperWrap.style.display = 'none';
         }
     } else {
         profileBox.style.display = 'none';
@@ -308,14 +335,25 @@ async function handleChangePasswordSubmit(e) {
 }
 
 async function handleLogout() {
+    isLoggingOut = true;
     try {
         await apiFetch('/api/auth/logout', { method: 'POST' });
     } catch (err) {}
     setToken(null);
     currentUser = null;
+    selectedToiletId = null;
+
+    closeLoginModal();
+    const panelBody = document.getElementById('panel-body');
+    if (panelBody) panelBody.style.display = 'none';
+
     updateUserUI();
-    showToast("Đã đăng xuất", "OFFLINE");
+    showToast("Đã đăng xuất thành công", "OK");
     switchView('dashboard');
+
+    setTimeout(() => {
+        isLoggingOut = false;
+    }, 1500);
 }
 
 // ================= REALTIME WEBSOCKET & AUTO-POLLING FALLBACK =================
@@ -323,6 +361,9 @@ let autoPollTimer = null;
 function startAutoPolling() {
     if (autoPollTimer) return;
     autoPollTimer = setInterval(async () => {
+        // CHỈ polling khi người dùng đang đăng nhập và không trong quá trình đăng xuất
+        if ((!currentUser && !getToken()) || isLoggingOut) return;
+
         // 1. Tự động cập nhật bảng thông tin Toilet và danh sách Cabin nếu đang mở xem
         if (selectedToiletId) {
             try {
@@ -407,29 +448,74 @@ function initWebSocket() {
 }
 
 function handleWsMessage(msg) {
-    if (msg.event === 'STATE_UPDATE') {
+    if (msg.event === 'STATE_UPDATE' || msg.event === 'GATEWAY_UPDATE') {
         const data = msg.data;
         // Update floor markers if current floor matches
-        if (currentFloor && currentFloor.id === data.floor_id) {
+        if (data.floor_id && currentFloor && currentFloor.id === data.floor_id) {
             // Update in-memory currentFloorToilets so subsequent renderMarkers preserves the status
             const t = currentFloorToilets.find(x => x.id === data.toilet_id);
+            const incomingSt = data.status || data.toilet_status;
             if (t) {
-                t.status = data.status;
+                if (incomingSt && incomingSt !== 'undefined') {
+                    t.status = incomingSt;
+                }
                 if (data.gateway_online !== undefined) t.gateway_online = data.gateway_online;
+                if (data.toilet_min_paper !== undefined && data.toilet_min_paper !== null) {
+                    t.min_paper = data.toilet_min_paper;
+                } else if (data.devices && data.devices.length > 0) {
+                    t.min_paper = Math.min(...data.devices.map(d => d.paper_level));
+                }
             }
             const marker = document.getElementById(`toilet-marker-${data.toilet_id}`);
             if (marker) {
-                marker.className = `toilet-marker ${data.status} ${selectedToiletId === data.toilet_id ? 'selected' : ''}`;
+                const effectiveSt = (incomingSt && incomingSt !== 'undefined') ? incomingSt : (t ? t.status : 'OK');
+                marker.className = `toilet-marker ${effectiveSt} ${selectedToiletId === data.toilet_id ? 'selected' : ''}`;
                 const label = marker.querySelector('.marker-label');
                 if (label) {
-                    const statusText = (data.status === 'OFFLINE') ? 'Mất kết nối' : (t ? `${Math.round(t.min_paper)}%` : '');
+                    const minPaperVal = (t && t.min_paper !== undefined && t.min_paper !== null) ? `${Math.round(t.min_paper)}%` : '';
+                    const statusText = (effectiveSt === 'OFFLINE') ? 'Mất kết nối' : minPaperVal;
                     label.innerText = `${data.toilet_name || (t ? t.name : '')} (${statusText})`;
                 }
             }
         }
         // Update detail panel if this toilet is currently selected
-        if (selectedToiletId === data.toilet_id) {
+        if (data.toilet_id && selectedToiletId === data.toilet_id) {
             updateToiletDetailPanelFromWs(data);
+        }
+
+        // TỰ ĐỘNG CẬP NHẬT TRẠNG THÁI WC & GATEWAY TRONG TAB "Quản lý Phân cấp Gateway & Thiết Bị ESP"
+        updateGatewayTreeFromWs(data);
+
+        // Update summary table if currently visible
+        if (document.getElementById('view-summary') && document.getElementById('view-summary').style.display !== 'none') {
+            loadSummaryData();
+        }
+    } else if (msg.event === 'DISCOVERED_CLIENT_DELETED') {
+        const deletedMac = (msg.data && msg.data.mac_address) ? msg.data.mac_address.toUpperCase() : '';
+        if (deletedMac) {
+            if (currentSelectedToiletData && currentSelectedToiletData.discovered_devices) {
+                currentSelectedToiletData.discovered_devices = currentSelectedToiletData.discovered_devices.filter(
+                    d => (d.mac_address || '').toUpperCase() !== deletedMac
+                );
+                renderToiletDetailPanel(currentSelectedToiletData);
+            }
+            Object.keys(currentDiscoveredMap).forEach(k => {
+                if (Array.isArray(currentDiscoveredMap[k])) {
+                    currentDiscoveredMap[k] = currentDiscoveredMap[k].filter(
+                        d => (d.mac_address || '').toUpperCase() !== deletedMac
+                    );
+                }
+            });
+            if (currentAdminGateways) {
+                currentAdminGateways.forEach(gw => {
+                    if (gw.discovered_devices) {
+                        gw.discovered_devices = gw.discovered_devices.filter(
+                            d => (d.mac_address || '').toUpperCase() !== deletedMac
+                        );
+                    }
+                });
+                renderAdminGatewaysTree();
+            }
         }
     } else if (msg.event === 'DISCOVERED_CLIENTS_UPDATE') {
         const data = msg.data;
@@ -438,6 +524,7 @@ function handleWsMessage(msg) {
             currentSelectedToiletData.discovered_devices = data.discovered_devices;
             renderToiletDetailPanel(currentSelectedToiletData);
         }
+        updateGatewayTreeFromWs(data);
     } else if (msg.event === 'NEW_ALERT') {
         const alertData = msg.data;
         showToast(`CẢNH BÁO [${alertData.type}]: ${alertData.toilet_name} (${alertData.device_label})`, alertData.type);
@@ -482,7 +569,16 @@ function switchView(viewName) {
     }
 
     if (viewName === 'dashboard') {
-        if (currentPdfPage && currentZoomLevel === 1.0 && currentFloor) {
+        if (currentFloor && (currentUser || getToken()) && !isLoggingOut) {
+            apiFetch(`/api/floors/${currentFloor.id}`).then(r => r.ok ? r.json() : null).then(fl => {
+                if (fl && fl.toilets) {
+                    currentFloorToilets = fl.toilets;
+                    renderMarkers();
+                    if (selectedToiletId) selectToilet(selectedToiletId);
+                }
+            }).catch(() => {});
+        }
+        if ((currentMapImage || currentPdfPage) && currentZoomLevel === 1.0 && currentFloor) {
             setTimeout(() => {
                 basePdfScale = calculateBasePdfScale();
                 renderCurrentPdfPage();
@@ -494,7 +590,7 @@ function switchView(viewName) {
         loadAlertsData();
     } else if (viewName === 'admin') {
         loadAdminUsers();
-        loadAdminMapsOptions();
+        loadAdminTerminals();
         loadAdminGateways();
         loadAdminDevices();
     }
@@ -569,15 +665,28 @@ async function onFloorChanged() {
         currentFloor = await res.json();
         currentFloorToilets = currentFloor.toilets || [];
 
-        renderFloorPdf(currentFloor.map_pdf_path);
+        await renderFloorMap(currentFloor.map_image_path, currentFloor.map_pdf_path);
     } catch (err) {
         console.error("Error loading floor:", err);
     }
 }
 
-// ================= PDF RENDERING & MARKERS =================
+// ================= MAP / PDF RENDERING & MARKERS =================
 function calculateBasePdfScale() {
-    if (!currentPdfPage) return 1.0;
+    let unscaledWidth = 0;
+    let unscaledHeight = 0;
+
+    if (currentMapImage) {
+        unscaledWidth = currentMapImage.naturalWidth || currentMapImage.width;
+        unscaledHeight = currentMapImage.naturalHeight || currentMapImage.height;
+    } else if (currentPdfPage) {
+        const unscaledViewport = currentPdfPage.getViewport({ scale: 1.0 });
+        unscaledWidth = unscaledViewport.width;
+        unscaledHeight = unscaledViewport.height;
+    } else {
+        return 1.0;
+    }
+
     const container = document.getElementById('map-scroll-wrapper');
     if (!container) return 1.0;
 
@@ -587,14 +696,58 @@ function calculateBasePdfScale() {
     const availWidth = Math.max(160, container.clientWidth - paddingX);
     const availHeight = Math.max(160, (container.clientHeight || 500) - paddingY);
 
-    const unscaledViewport = currentPdfPage.getViewport({ scale: 1.0 });
-    const scaleX = availWidth / unscaledViewport.width;
-    const scaleY = availHeight / unscaledViewport.height;
+    const scaleX = availWidth / unscaledWidth;
+    const scaleY = availHeight / unscaledHeight;
 
     // Baseline fit scale
     const fitScale = Math.min(scaleX, scaleY);
     // User requested that what was 75% zoom level is now the standard 100% zoom level (1.75 * 0.75 = 1.3125)
     return fitScale * 1.3125;
+}
+
+async function renderFloorMap(imageUrl, pdfUrl) {
+    currentMapImage = null;
+    currentPdfPage = null;
+    currentPdfDoc = null;
+
+    if (!imageUrl && !pdfUrl) {
+        document.getElementById('map-loading').innerText = "Tầng này chưa có bản đồ. Hãy tải lên trong trang Quản trị.";
+        const zoomCtrl = document.getElementById('map-zoom-controls');
+        if (zoomCtrl) zoomCtrl.style.display = 'none';
+        return;
+    }
+
+    // Ưu tiên 1: Tải ảnh rasterized siêu tốc (< 50ms) nếu có
+    if (imageUrl) {
+        try {
+            const img = new Image();
+            img.src = imageUrl;
+            if (img.decode) {
+                await img.decode();
+            } else {
+                await new Promise((resolve, reject) => {
+                    img.onload = resolve;
+                    img.onerror = reject;
+                });
+            }
+            currentMapImage = img;
+            basePdfScale = calculateBasePdfScale();
+            currentZoomLevel = 1.0;
+            await renderCurrentPdfPage();
+
+            const zoomCtrl = document.getElementById('map-zoom-controls');
+            if (zoomCtrl) zoomCtrl.style.display = 'flex';
+            return;
+        } catch (imgErr) {
+            console.warn("Không thể tải ảnh bản đồ, fallback sang PDF.js:", imgErr);
+            currentMapImage = null;
+        }
+    }
+
+    // Ưu tiên 2: Fallback sang PDF.js nếu không có ảnh hoặc tải ảnh lỗi
+    if (pdfUrl) {
+        await renderFloorPdf(pdfUrl);
+    }
 }
 
 async function renderFloorPdf(pdfUrl) {
@@ -626,30 +779,53 @@ async function renderFloorPdf(pdfUrl) {
 }
 
 async function renderCurrentPdfPage() {
-    if (!currentPdfPage || isRenderingPdf) return;
+    if ((!currentMapImage && !currentPdfPage) || isRenderingPdf) return;
     isRenderingPdf = true;
 
     try {
         const scale = basePdfScale * currentZoomLevel;
-        const viewport = currentPdfPage.getViewport({ scale: scale });
-
         const canvas = document.getElementById('pdf-canvas');
         const context = canvas.getContext('2d');
-        canvas.width = viewport.width;
-        canvas.height = viewport.height;
+        const canvasContainer = document.getElementById('map-canvas-container');
 
-        const renderContext = {
-            canvasContext: context,
-            viewport: viewport
-        };
+        let displayWidth = 0;
+        let displayHeight = 0;
 
-        await currentPdfPage.render(renderContext).promise;
+        if (currentMapImage) {
+            const unscaledWidth = currentMapImage.naturalWidth || currentMapImage.width;
+            const unscaledHeight = currentMapImage.naturalHeight || currentMapImage.height;
+            displayWidth = Math.round(unscaledWidth * scale);
+            displayHeight = Math.round(unscaledHeight * scale);
+
+            // Tối ưu độ nét cho màn hình Retina / High-DPI
+            const dpr = Math.min(window.devicePixelRatio || 1, 2);
+            canvas.width = Math.round(displayWidth * dpr);
+            canvas.height = Math.round(displayHeight * dpr);
+
+            // Vẽ ảnh tức thì bằng phần cứng đồ hoạ (hardware accelerated)
+            context.imageSmoothingEnabled = true;
+            context.imageSmoothingQuality = 'high';
+            context.drawImage(currentMapImage, 0, 0, canvas.width, canvas.height);
+        } else if (currentPdfPage) {
+            const viewport = currentPdfPage.getViewport({ scale: scale });
+            displayWidth = viewport.width;
+            displayHeight = viewport.height;
+
+            canvas.width = viewport.width;
+            canvas.height = viewport.height;
+
+            const renderContext = {
+                canvasContext: context,
+                viewport: viewport
+            };
+
+            await currentPdfPage.render(renderContext).promise;
+        }
 
         document.getElementById('map-loading').style.display = 'none';
-        const canvasContainer = document.getElementById('map-canvas-container');
         canvasContainer.style.display = 'block';
-        canvasContainer.style.width = `${viewport.width}px`;
-        canvasContainer.style.height = `${viewport.height}px`;
+        canvasContainer.style.width = `${displayWidth}px`;
+        canvasContainer.style.height = `${displayHeight}px`;
 
         const zoomText = document.getElementById('zoom-percentage');
         if (zoomText) {
@@ -665,7 +841,7 @@ async function renderCurrentPdfPage() {
 }
 
 async function zoomMap(delta) {
-    if (!currentPdfPage) return;
+    if (!currentMapImage && !currentPdfPage) return;
     let newZoom = Math.round((currentZoomLevel + delta) * 100) / 100;
     newZoom = Math.max(0.35, Math.min(3.5, newZoom));
     if (newZoom === currentZoomLevel) return;
@@ -674,7 +850,7 @@ async function zoomMap(delta) {
 }
 
 async function resetZoomMap() {
-    if (!currentPdfPage) return;
+    if (!currentMapImage && !currentPdfPage) return;
     basePdfScale = calculateBasePdfScale();
     currentZoomLevel = 1.0;
     await renderCurrentPdfPage();
@@ -685,7 +861,7 @@ let mapResizeTimeout = null;
 window.addEventListener('resize', () => {
     clearTimeout(mapResizeTimeout);
     mapResizeTimeout = setTimeout(() => {
-        if (currentPdfPage && currentZoomLevel === 1.0 && currentFloor) {
+        if ((currentMapImage || currentPdfPage) && currentZoomLevel === 1.0 && currentFloor) {
             basePdfScale = calculateBasePdfScale();
             renderCurrentPdfPage();
         }
@@ -875,7 +1051,9 @@ function renderToiletDetailPanel(data) {
     const isGwOnline = !!data.gateway_online;
     const hasDevices = (savedDevices.length > 0);
     const isLiveAndInUse = hasGateway && isGwOnline && hasDevices;
-    const effectiveStatus = isLiveAndInUse ? data.status : 'OFFLINE';
+    const rawSt = data.status || data.toilet_status || 'OK';
+    const validSt = (rawSt && rawSt !== 'undefined') ? rawSt : 'OK';
+    const effectiveStatus = isLiveAndInUse ? validSt : 'OFFLINE';
 
     const statusPill = document.getElementById('panel-toilet-status');
     statusPill.style.display = 'inline-flex';
@@ -887,14 +1065,19 @@ function renderToiletDetailPanel(data) {
     } else if (!hasDevices) {
         statusPill.innerText = `● Chưa có thiết bị`;
     } else {
-        statusPill.innerText = `● ${data.status}`;
+        statusPill.innerText = `● ${effectiveStatus}`;
     }
 
-    document.getElementById('panel-gw-ip').innerText = data.gateway_ip || 'Chưa gán Gateway';
+    const gwMacEl = document.getElementById('panel-gw-mac');
+    if (gwMacEl) gwMacEl.innerText = data.gateway_mac || (data.gateway_ip ? 'Chưa gán MAC' : 'Chưa gán Gateway');
+    const gwIpWrapEl = document.getElementById('panel-gw-ip-wrapper');
+    if (gwIpWrapEl) {
+        gwIpWrapEl.innerText = data.gateway_ip ? `(IP: ${data.gateway_ip})` : '';
+    }
     const gwStatusEl = document.getElementById('panel-gw-status');
     const pingBtn = document.getElementById('btn-ping-gw');
 
-    if (data.gateway_ip) {
+    if (data.gateway_mac || data.gateway_ip) {
         if (pingBtn) pingBtn.style.display = 'inline-block';
         if (data.gateway_online) {
             gwStatusEl.innerHTML = `<span style="background: #dcfce7; color: #15803d; border: 1px solid #86efac; padding: 1px 6px; border-radius: 9999px; font-weight: 600;">🟢 Online</span>`;
@@ -909,6 +1092,30 @@ function renderToiletDetailPanel(data) {
     const coordsEl = document.getElementById('panel-coords');
     if (coordsEl) {
         coordsEl.innerText = `X: ${Math.round((data.x || 0) * 100)}%, Y: ${Math.round((data.y || 0) * 100)}%`;
+    }
+
+    const isAdmin = (currentUser && currentUser.role === 'admin');
+    const paperWrapEl = document.getElementById('panel-toilet-paper-wrap');
+    if (paperWrapEl) {
+        paperWrapEl.style.display = isAdmin ? 'flex' : 'none';
+    }
+    const paperNameEl = document.getElementById('panel-toilet-paper-name');
+    const paperBadgeEl = document.getElementById('panel-toilet-paper-badge');
+    if (paperNameEl) {
+        paperNameEl.innerText = data.effective_profile_name || data.paper_profile_name || 'Cấu hình mặc định toàn hệ thống';
+    }
+    if (paperBadgeEl) {
+        if (data.paper_profile_id) {
+            paperBadgeEl.innerText = '🏢 Riêng WC';
+            paperBadgeEl.style.background = '#e0f2fe';
+            paperBadgeEl.style.color = '#0369a1';
+            paperBadgeEl.style.border = '1px solid #7dd3fc';
+        } else {
+            paperBadgeEl.innerText = '⚙️ Mặc định';
+            paperBadgeEl.style.background = '#f1f5f9';
+            paperBadgeEl.style.color = '#475569';
+            paperBadgeEl.style.border = '1px solid #cbd5e1';
+        }
     }
 
     const cabinList = document.getElementById('panel-cabin-list');
@@ -947,11 +1154,17 @@ function renderToiletDetailPanel(data) {
                     <span>MAC: <code>${dev.mac_address}</code></span>
                     <span>Cập nhật: ${lastSeenText}</span>
                 </div>
+                ${isAdmin ? `
+                <div style="font-size: 0.73rem; color: #475569; margin-top: 4px; display: flex; align-items: center; gap: 5px; flex-wrap: wrap;">
+                    <span>🧻 Cấu hình: <strong>${dev.effective_profile_name || data.effective_profile_name || 'Mặc định'}</strong></span>
+                    ${dev.paper_profile_id ? '<span class="badge" style="background:#e0f2fe; color:#0369a1; border:1px solid #7dd3fc; font-size:0.68rem; padding:1px 5px; font-weight:700;">(Riêng Cabin)</span>' : '<span style="color:#64748b; font-size:0.68rem;">(Theo WC)</span>'}
+                </div>
+                ` : ''}
                 <div style="margin-top: 0.5rem; display: flex; justify-content: space-between; align-items: center;">
                     <button class="btn btn-secondary btn-sm" onclick="viewDeviceChart(${dev.id}, '${dev.label}')">📈 Lịch sử</button>
                     ${(currentUser && currentUser.role === 'admin') ? `
                         <div style="display: flex; gap: 0.35rem;">
-                            <button class="btn btn-secondary btn-sm" onclick="openEditDeviceModal(${dev.id}, '${dev.mac_address}', '${dev.label}', ${data.gateway_id || 0}, ${dev.cabin_order || 1})" title="Sửa thông tin cabin">✏️ Sửa</button>
+                            <button class="btn btn-secondary btn-sm" onclick="openEditDeviceModal(${dev.id}, '${dev.mac_address}', '${dev.label}', ${data.gateway_id || 0}, ${dev.cabin_order || 1}, ${dev.paper_profile_id || 'null'})" title="Sửa thông tin cabin">✏️ Sửa</button>
                             <button class="btn btn-danger btn-sm" onclick="handleDeleteDevice(${dev.id})" title="Xoá cabin này">🗑️</button>
                         </div>
                     ` : ''}
@@ -1002,13 +1215,18 @@ function renderToiletDetailPanel(data) {
                     <span>MAC: <code>${d.mac_address}</code></span>
                     <span>Nhận: ${lastSeenText}</span>
                 </div>
-                <div style="margin-top: 0.5rem; display: flex; justify-content: space-between; align-items: center;">
+                <div style="margin-top: 0.5rem; display: flex; justify-content: space-between; align-items: center; gap: 0.5rem; flex-wrap: wrap;">
                     <span style="font-size: 0.75rem; color: #b45309; font-weight: 600;">
                         ⚡ Đang phát sóng (Chưa lưu)
                     </span>
-                    <button class="btn btn-primary btn-sm" onclick="quickSaveDiscoveredDevice('${d.mac_address}', ${data.gateway_id || 0}, ${data.id})" title="Thêm client này vào hệ thống và lưu lại">
-                        ➕ Thêm vào App (Lưu)
-                    </button>
+                    <div style="display: flex; gap: 0.35rem;">
+                        <button class="btn btn-primary btn-sm" onclick="quickSaveDiscoveredDevice('${d.mac_address}', ${data.gateway_id || 0}, ${data.id})" title="Thêm client này vào hệ thống và lưu lại">
+                            ➕ Thêm vào App (Lưu)
+                        </button>
+                        <button class="btn btn-danger btn-sm" onclick="handleDeleteDiscoveredClient('${d.mac_address}', ${data.gateway_id || 0}, ${data.id})" title="Xóa bỏ tín hiệu Client mới phát hiện này">
+                            🗑️ Xóa
+                        </button>
+                    </div>
                 </div>
             `;
             discSection.appendChild(card);
@@ -1020,8 +1238,13 @@ function renderToiletDetailPanel(data) {
 
 function updateToiletDetailPanelFromWs(wsData) {
     if (currentSelectedToiletData && currentSelectedToiletData.id === wsData.toilet_id) {
-        currentSelectedToiletData.status = wsData.status;
-        currentSelectedToiletData.devices = wsData.devices;
+        const newStatus = wsData.status || wsData.toilet_status;
+        if (newStatus && newStatus !== 'undefined') {
+            currentSelectedToiletData.status = newStatus;
+        }
+        if (wsData.devices) {
+            currentSelectedToiletData.devices = wsData.devices;
+        }
         if (wsData.gateway_online !== undefined) {
             currentSelectedToiletData.gateway_online = wsData.gateway_online;
         }
@@ -1031,8 +1254,21 @@ function updateToiletDetailPanelFromWs(wsData) {
         if (wsData.discovered_devices !== undefined) {
             currentSelectedToiletData.discovered_devices = wsData.discovered_devices;
         }
+        if (wsData.paper_profile_id !== undefined) {
+            currentSelectedToiletData.paper_profile_id = wsData.paper_profile_id;
+        }
+        if (wsData.paper_profile_name !== undefined) {
+            currentSelectedToiletData.paper_profile_name = wsData.paper_profile_name;
+        }
+        if (wsData.effective_profile_name !== undefined) {
+            currentSelectedToiletData.effective_profile_name = wsData.effective_profile_name;
+        }
     }
-    renderToiletDetailPanel(currentSelectedToiletData || wsData);
+    const finalData = currentSelectedToiletData || wsData;
+    if (!finalData.status || finalData.status === 'undefined') {
+        finalData.status = wsData.status || wsData.toilet_status || 'OK';
+    }
+    renderToiletDetailPanel(finalData);
 }
 
 function quickSaveDiscoveredDevice(mac, gatewayId, toiletId) {
@@ -1048,6 +1284,58 @@ function quickSaveDiscoveredDevice(mac, gatewayId, toiletId) {
         macInput.value = mac;
         macInput.style.borderColor = '#10b981';
         macInput.style.backgroundColor = '#ecfdf5';
+    }
+}
+
+async function handleDeleteDiscoveredClient(mac, gatewayId, toiletId) {
+    if (!currentUser || currentUser.role !== 'admin') {
+        showToast("Vui lòng đăng nhập quyền Quản trị viên (Admin) để xóa client", "LOW");
+        openLoginModal();
+        return;
+    }
+    if (!confirm(`Bạn có chắc chắn muốn xóa tín hiệu Client mới phát hiện [${mac}] này không?`)) {
+        return;
+    }
+    try {
+        const res = await apiFetch(`/api/gateways/discovered/${encodeURIComponent(mac)}`, {
+            method: 'DELETE'
+        });
+        if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            showToast(err.detail || err.message || 'Không thể xóa client mới phát hiện', 'danger');
+            return;
+        }
+
+        showToast(`Đã xóa client mới phát hiện [${mac}]`, 'success');
+
+        const upperMac = mac.toUpperCase();
+        if (currentSelectedToiletData && currentSelectedToiletData.discovered_devices) {
+            currentSelectedToiletData.discovered_devices = currentSelectedToiletData.discovered_devices.filter(
+                d => (d.mac_address || '').toUpperCase() !== upperMac
+            );
+            renderToiletDetailPanel(currentSelectedToiletData);
+        }
+
+        Object.keys(currentDiscoveredMap).forEach(k => {
+            if (Array.isArray(currentDiscoveredMap[k])) {
+                currentDiscoveredMap[k] = currentDiscoveredMap[k].filter(
+                    d => (d.mac_address || '').toUpperCase() !== upperMac
+                );
+            }
+        });
+
+        if (currentAdminGateways) {
+            currentAdminGateways.forEach(gw => {
+                if (gw.discovered_devices) {
+                    gw.discovered_devices = gw.discovered_devices.filter(
+                        d => (d.mac_address || '').toUpperCase() !== upperMac
+                    );
+                }
+            });
+            renderAdminGatewaysTree();
+        }
+    } catch (e) {
+        showToast('Lỗi khi xóa client: ' + e.message, 'danger');
     }
 }
 
@@ -1242,12 +1530,16 @@ function handleMapClick(event) {
     pendingPlacementCoords = { x, y };
     document.getElementById('new-toilet-coords').innerText = `${x}, ${y}`;
     document.getElementById('new-toilet-name').value = '';
-    const gwInput = document.getElementById('new-toilet-gw-ip');
-    if (assignedGatewayIpForPlacement) {
-        gwInput.value = assignedGatewayIpForPlacement;
+    const macInput = document.getElementById('new-toilet-gw-mac');
+    const ipInput = document.getElementById('new-toilet-gw-ip');
+    if (assignedGatewayMacForPlacement || assignedGatewayIpForPlacement) {
+        if (macInput) macInput.value = assignedGatewayMacForPlacement || '';
+        if (ipInput) ipInput.value = assignedGatewayIpForPlacement || '';
     } else {
-        gwInput.value = '';
+        if (macInput) macInput.value = '';
+        if (ipInput) ipInput.value = '';
     }
+    populateGatewayDropdown('new-toilet-gw-select', assignedGatewayMacForPlacement || assignedGatewayIpForPlacement);
     document.getElementById('modal-add-toilet').style.display = 'flex';
 }
 
@@ -1260,7 +1552,8 @@ async function handleAddToiletSubmit(e) {
     if (!currentFloor || !pendingPlacementCoords) return;
 
     const name = document.getElementById('new-toilet-name').value.trim();
-    const gwIp = document.getElementById('new-toilet-gw-ip').value.trim();
+    const gwMac = (document.getElementById('new-toilet-gw-mac')?.value || '').trim();
+    const gwIp = (document.getElementById('new-toilet-gw-ip')?.value || '').trim();
 
     try {
         const res = await apiFetch('/api/admin/toilets', {
@@ -1270,6 +1563,7 @@ async function handleAddToiletSubmit(e) {
                 name: name,
                 x: pendingPlacementCoords.x,
                 y: pendingPlacementCoords.y,
+                gateway_mac: gwMac || null,
                 gateway_ip: gwIp || null
             })
         });
@@ -1282,11 +1576,12 @@ async function handleAddToiletSubmit(e) {
 
         closeAddToiletModal();
         togglePlacementMode();
+        assignedGatewayMacForPlacement = null;
         assignedGatewayIpForPlacement = null;
         showToast("Đã thêm nhà vệ sinh mới!", "OK");
         await onFloorChanged();
     } catch (err) {
-        alert("Lỗi kết nối");
+        alert("Lỗi kết nối: " + err.message);
     }
 }
 
@@ -1348,30 +1643,99 @@ function openEditCurrentToiletModal() {
         showToast("Chưa chọn nhà vệ sinh", "LOW");
         return;
     }
+    const gwMac = currentSelectedToiletData.gateway_mac || '';
     const gwIp = currentSelectedToiletData.gateway_ip || '';
     document.getElementById('edit-toilet-id').value = currentSelectedToiletData.id;
     document.getElementById('edit-toilet-floor-id').value = currentFloor ? currentFloor.id : '';
     document.getElementById('edit-toilet-terminal-id').value = currentFloor ? currentFloor.terminal_id : '';
     document.getElementById('edit-toilet-name').value = currentSelectedToiletData.name;
-    document.getElementById('edit-toilet-gw-ip').value = gwIp;
+    const macInput = document.getElementById('edit-toilet-gw-mac');
+    const ipInput = document.getElementById('edit-toilet-gw-ip');
+    if (macInput) macInput.value = gwMac;
+    if (ipInput) ipInput.value = gwIp;
     document.getElementById('edit-toilet-x').value = currentSelectedToiletData.x;
     document.getElementById('edit-toilet-y').value = currentSelectedToiletData.y;
+    populateGatewayDropdown('edit-toilet-gw-select', gwMac || gwIp);
     document.getElementById('modal-edit-toilet').style.display = 'flex';
     
-    // Check and show live discovered clients for this Gateway IP
-    checkDiscoveredClientsForModal(gwIp);
+    // Check and show live discovered clients for this Gateway MAC/IP
+    checkDiscoveredClientsForModal(gwMac || gwIp);
 }
 
-async function checkDiscoveredClientsForModal(ip) {
+let cachedAdminGateways = [];
+async function fetchAdminGatewaysList() {
+    try {
+        const res = await apiFetch('/api/admin/gateways');
+        if (res.ok) {
+            cachedAdminGateways = await res.json();
+            return cachedAdminGateways;
+        }
+    } catch (e) {}
+    return [];
+}
+
+async function populateGatewayDropdown(selectId, selectedVal) {
+    const sel = document.getElementById(selectId);
+    if (!sel) return;
+    const gateways = await fetchAdminGatewaysList();
+    sel.innerHTML = '<option value="">[Không gán Gateway / Tự nhập thủ công]</option>';
+    gateways.forEach(gw => {
+        const opt = document.createElement('option');
+        opt.value = gw.mac_address || gw.ip_address || '';
+        opt.dataset.mac = gw.mac_address || '';
+        opt.dataset.ip = gw.ip_address || '';
+        const st = gw.is_online ? '🟢 Online' : '⚪ Offline';
+        const toiletInfo = gw.toilet_name ? ` ➔ ${gw.toilet_name}` : ' (Chưa gán WC)';
+        opt.innerText = `${st} | MAC: ${gw.mac_address || 'Chưa có'} | IP: ${gw.ip_address || '---'}${toiletInfo}`;
+        if (selectedVal && (gw.mac_address === selectedVal || gw.ip_address === selectedVal)) {
+            opt.selected = true;
+        }
+        sel.appendChild(opt);
+    });
+}
+
+function onNewToiletGwSelectChange(val) {
+    const sel = document.getElementById('new-toilet-gw-select');
+    const selectedOpt = sel ? sel.options[sel.selectedIndex] : null;
+    const macInput = document.getElementById('new-toilet-gw-mac');
+    const ipInput = document.getElementById('new-toilet-gw-ip');
+    if (selectedOpt && selectedOpt.dataset && selectedOpt.value) {
+        if (macInput) macInput.value = selectedOpt.dataset.mac || '';
+        if (ipInput) ipInput.value = selectedOpt.dataset.ip || '';
+    } else {
+        if (macInput) macInput.value = '';
+        if (ipInput) ipInput.value = '';
+    }
+}
+
+function onEditToiletGwSelectChange(val) {
+    const sel = document.getElementById('edit-toilet-gw-select');
+    const selectedOpt = sel ? sel.options[sel.selectedIndex] : null;
+    const macInput = document.getElementById('edit-toilet-gw-mac');
+    const ipInput = document.getElementById('edit-toilet-gw-ip');
+    if (selectedOpt && selectedOpt.dataset && selectedOpt.value) {
+        const mac = selectedOpt.dataset.mac || '';
+        const ip = selectedOpt.dataset.ip || '';
+        if (macInput) macInput.value = mac;
+        if (ipInput) ipInput.value = ip;
+        checkDiscoveredClientsForModal(mac || ip);
+    } else {
+        if (macInput) macInput.value = '';
+        if (ipInput) ipInput.value = '';
+        checkDiscoveredClientsForModal('');
+    }
+}
+
+async function checkDiscoveredClientsForModal(identifier) {
     const preview = document.getElementById('edit-toilet-discovered-preview');
     if (!preview) return;
-    const cleanIp = (ip || '').trim();
-    if (!cleanIp) {
+    const cleanId = (identifier || '').trim();
+    if (!cleanId) {
         preview.style.display = 'none';
         return;
     }
     try {
-        const res = await apiFetch(`/api/gateways/discovered?ip=${encodeURIComponent(cleanIp)}`);
+        const res = await apiFetch(`/api/gateways/discovered?ip=${encodeURIComponent(cleanId)}`);
         if (!res.ok) {
             preview.style.display = 'none';
             return;
@@ -1385,7 +1749,7 @@ async function checkDiscoveredClientsForModal(ip) {
             preview.style.padding = '8px 12px';
             preview.style.borderRadius = '6px';
             preview.innerHTML = `
-                <div style="font-weight: 600; margin-bottom: 4px;">📡 Đã phát hiện ${clients.length} Client đang phát sóng tới IP này:</div>
+                <div style="font-weight: 600; margin-bottom: 4px;">📡 Đã phát hiện ${clients.length} Client đang phát sóng tới Gateway này:</div>
                 ${clients.map(c => `
                     <div style="font-size: 0.775rem; margin-top: 2px;">
                         • MAC: <code>${c.mac_address}</code> | Giấy: <strong>${Math.round(c.paper_level)}%</strong> ${c.distance !== null && c.distance !== undefined ? `(${c.distance} mm)` : ''} | Pin: <strong>${Math.round(c.battery)}%</strong>
@@ -1402,7 +1766,7 @@ async function checkDiscoveredClientsForModal(ip) {
             preview.style.border = '1px solid #e2e8f0';
             preview.style.padding = '6px 10px';
             preview.style.borderRadius = '6px';
-            preview.innerHTML = `ℹ️ <em>Chưa có Client nào gửi tín hiệu tới IP này (sẽ tự động hiển thị ngay khi Client bắt đầu phát sóng).</em>`;
+            preview.innerHTML = `ℹ️ <em>Chưa có Client nào gửi tín hiệu tới Gateway này (sẽ tự động hiển thị ngay khi Client bắt đầu phát sóng).</em>`;
         }
     } catch (e) {
         preview.style.display = 'none';
@@ -1417,18 +1781,22 @@ async function handleEditToiletSubmit(e) {
     e.preventDefault();
     const id = parseInt(document.getElementById('edit-toilet-id').value);
     const name = document.getElementById('edit-toilet-name').value.trim();
-    const gwIp = document.getElementById('edit-toilet-gw-ip').value.trim();
+    const gwMac = (document.getElementById('edit-toilet-gw-mac')?.value || '').trim();
+    const gwIp = (document.getElementById('edit-toilet-gw-ip')?.value || '').trim();
     const x = parseFloat(document.getElementById('edit-toilet-x').value);
     const y = parseFloat(document.getElementById('edit-toilet-y').value);
 
     try {
+        const paperProfileId = parseInt(document.getElementById('edit-toilet-paper-profile')?.value) || null;
         const res = await apiFetch(`/api/admin/toilets/${id}`, {
             method: 'PUT',
             body: JSON.stringify({
                 name: name,
-                gateway_ip: gwIp,
+                gateway_mac: gwMac || null,
+                gateway_ip: gwIp || null,
                 x: x,
-                y: y
+                y: y,
+                paper_profile_id: paperProfileId
             })
         });
 
@@ -1446,26 +1814,36 @@ async function handleEditToiletSubmit(e) {
             await loadSummaryData();
         }
     } catch (err) {
-        alert("Lỗi kết nối khi cập nhật");
+        alert("Lỗi kết nối khi cập nhật: " + err.message);
     }
 }
 
-function openEditToiletModalById(id, name, gwIp, x, y, floorId, terminalId) {
+function openEditToiletModalById(id, name, gwIp, x, y, floorId, terminalId, gwMac) {
     if (!currentUser || currentUser.role !== 'admin') {
         showToast("Vui lòng đăng nhập quyền Quản trị viên (Admin) để sửa nhà vệ sinh", "LOW");
         openLoginModal();
         return;
     }
-    const cleanGw = (gwIp && gwIp !== 'None' && gwIp !== 'Chưa gán') ? gwIp : '';
+    const cleanGwIp = (gwIp && gwIp !== 'None' && gwIp !== 'Chưa gán') ? gwIp : '';
+    const cleanGwMac = (gwMac && gwMac !== 'None' && gwMac !== 'Chưa gán') ? gwMac : '';
     document.getElementById('edit-toilet-id').value = id;
     document.getElementById('edit-toilet-floor-id').value = floorId || (currentFloor ? currentFloor.id : '');
     document.getElementById('edit-toilet-terminal-id').value = terminalId || (currentFloor ? currentFloor.terminal_id : '');
     document.getElementById('edit-toilet-name').value = name || '';
-    document.getElementById('edit-toilet-gw-ip').value = cleanGw;
+    const macInput = document.getElementById('edit-toilet-gw-mac');
+    const ipInput = document.getElementById('edit-toilet-gw-ip');
+    if (macInput) macInput.value = cleanGwMac;
+    if (ipInput) ipInput.value = cleanGwIp;
     document.getElementById('edit-toilet-x').value = (x !== undefined && x !== null) ? x : 0.5;
     document.getElementById('edit-toilet-y').value = (y !== undefined && y !== null) ? y : 0.5;
+    populateGatewayDropdown('edit-toilet-gw-select', cleanGwMac || cleanGwIp);
+    const tData = (currentFloorToilets || []).find(t => t.id === id) || (currentSelectedToiletData && currentSelectedToiletData.id === id ? currentSelectedToiletData : null);
+    const toiletProfileSelect = document.getElementById('edit-toilet-paper-profile');
+    if (toiletProfileSelect) {
+        toiletProfileSelect.value = (tData && tData.paper_profile_id) ? tData.paper_profile_id : '';
+    }
     document.getElementById('modal-edit-toilet').style.display = 'flex';
-    checkDiscoveredClientsForModal(cleanGw);
+    checkDiscoveredClientsForModal(cleanGwMac || cleanGwIp);
 }
 
 function handleRepositionFromEditModal() {
@@ -1585,7 +1963,7 @@ async function loadSummaryData() {
                             🗺️ Xem
                         </button>
                         ${(currentUser && currentUser.role === 'admin') ? `
-                            <button class="btn btn-secondary btn-sm" onclick="openEditToiletModalById(${item.id}, '${item.name.replace(/'/g, "\\'")}', '${item.gateway_ip === 'Chưa gán' ? '' : item.gateway_ip}', ${item.x !== undefined ? item.x : 0.5}, ${item.y !== undefined ? item.y : 0.5}, ${item.floor_id}, ${item.terminal_id})" title="Sửa thông tin">
+                            <button class="btn btn-secondary btn-sm" onclick="openEditToiletModalById(${item.id}, '${item.name.replace(/'/g, "\\'")}', '${item.gateway_ip === 'Chưa gán' ? '' : item.gateway_ip}', ${item.x !== undefined ? item.x : 0.5}, ${item.y !== undefined ? item.y : 0.5}, ${item.floor_id}, ${item.terminal_id}, '${item.gateway_mac || ''}')" title="Sửa thông tin">
                                 ✏️ Sửa
                             </button>
                             <button class="btn btn-danger btn-sm" onclick="handleDeleteToiletById(${item.id}, '${item.name.replace(/'/g, "\\'")}')" title="Xoá nhà vệ sinh">
@@ -1818,14 +2196,14 @@ async function handleAcknowledgeAllAlerts(fromPopup = false) {
 
 // ================= VIEW 4: ADMIN TABS & MANAGEMENT =================
 function switchAdminTab(tabName) {
-    const tabs = ['users', 'maps', 'gateways', 'paper'];
+    const tabs = ['users', 'terminals', 'gateways', 'paper'];
     tabs.forEach(t => {
         const el = document.getElementById(`admin-tab-${t}`);
         if (el) el.style.display = (t === tabName) ? 'block' : 'none';
     });
 
     const btns = document.querySelectorAll('#view-admin .tab-btn');
-    const idxMap = { 'users': 0, 'maps': 1, 'gateways': 2, 'paper': 3 };
+    const idxMap = { 'users': 0, 'terminals': 1, 'gateways': 2, 'paper': 3 };
     btns.forEach((b, i) => {
         b.className = (i === idxMap[tabName]) ? 'tab-btn active' : 'tab-btn';
     });
@@ -1837,172 +2215,151 @@ function switchAdminTab(tabName) {
         loadAdminDevices();
     } else if (tabName === 'users') {
         loadAdminUsers();
-    } else if (tabName === 'maps') {
-        loadAdminMapsOptions();
+    } else if (tabName === 'terminals') {
+        loadAdminTerminals();
     }
 }
+
+// ================= MULTI-PROFILE PAPER ROLL SETTINGS & HIERARCHICAL ASSIGNMENT =================
+let currentPaperProfiles = [];
+let currentSelectedPaperProfileId = null;
+let paperAssignmentsData = [];
 
 async function loadAdminPaperSettings() {
     try {
-        const res = await apiFetch('/api/settings/paper');
+        const res = await apiFetch('/api/admin/paper/profiles');
         if (!res.ok) return;
-        const cfg = await res.json();
-        if (document.getElementById('setting-empty-dist')) {
-            document.getElementById('setting-empty-dist').value = cfg.empty_distance_mm || 140;
+        currentPaperProfiles = await res.json();
+
+        // Populate paper profile selector
+        const selectEl = document.getElementById('paper-profile-select');
+        const copyFromSelect = document.getElementById('new-profile-copy-from');
+        const toiletModalSelect = document.getElementById('edit-toilet-paper-profile');
+        const devModalSelect = document.getElementById('form-device-paper-profile');
+        const addCabinSelect = document.getElementById('add-cabin-paper-profile');
+
+        if (selectEl) selectEl.innerHTML = '';
+        if (copyFromSelect) copyFromSelect.innerHTML = '';
+        if (toiletModalSelect) toiletModalSelect.innerHTML = '<option value="">[Sử dụng Cấu hình mặc định toàn hệ thống]</option>';
+        if (devModalSelect) devModalSelect.innerHTML = '<option value="">[Kế thừa theo WC / Mặc định hệ thống]</option>';
+        if (addCabinSelect) addCabinSelect.innerHTML = '<option value="">[Kế thừa theo WC / Mặc định hệ thống]</option>';
+
+        let defaultProfile = null;
+        currentPaperProfiles.forEach(p => {
+            if (p.is_default) defaultProfile = p;
+
+            if (selectEl) {
+                const opt = document.createElement('option');
+                opt.value = p.id;
+                opt.innerText = `${p.name} ${p.is_default ? '★ (Mặc định)' : ''} [${p.assigned_toilets_count} WC, ${p.assigned_devices_count} Cabin]`;
+                selectEl.appendChild(opt);
+            }
+            if (copyFromSelect) {
+                const opt = document.createElement('option');
+                opt.value = p.id;
+                opt.innerText = p.name;
+                copyFromSelect.appendChild(opt);
+            }
+            if (toiletModalSelect) {
+                const opt = document.createElement('option');
+                opt.value = p.id;
+                opt.innerText = `${p.name} ${p.is_default ? '(Mặc định)' : ''}`;
+                toiletModalSelect.appendChild(opt);
+            }
+            if (devModalSelect) {
+                const opt = document.createElement('option');
+                opt.value = p.id;
+                opt.innerText = `${p.name} ${p.is_default ? '(Mặc định)' : ''}`;
+                devModalSelect.appendChild(opt);
+            }
+            if (addCabinSelect) {
+                const opt = document.createElement('option');
+                opt.value = p.id;
+                opt.innerText = `${p.name} ${p.is_default ? '(Mặc định)' : ''}`;
+                addCabinSelect.appendChild(opt);
+            }
+        });
+
+        // Determine which profile is currently selected
+        if (!currentSelectedPaperProfileId || !currentPaperProfiles.some(p => p.id === currentSelectedPaperProfileId)) {
+            currentSelectedPaperProfileId = defaultProfile ? defaultProfile.id : (currentPaperProfiles[0] ? currentPaperProfiles[0].id : null);
         }
-        if (document.getElementById('setting-roll-thick')) {
-            document.getElementById('setting-roll-thick').value = cfg.roll_thickness_mm || 110;
+
+        if (selectEl && currentSelectedPaperProfileId) {
+            selectEl.value = currentSelectedPaperProfileId;
         }
-        if (document.getElementById('setting-warn-low')) {
-            document.getElementById('setting-warn-low').value = cfg.warn_low_cm || 1.5;
-        }
-        if (document.getElementById('setting-warn-low-uses')) {
-            document.getElementById('setting-warn-low-uses').value = cfg.warn_low_uses || 60;
-        }
-        if (document.getElementById('setting-warn-mid')) {
-            document.getElementById('setting-warn-mid').value = cfg.warn_mid_cm || 1.0;
-        }
-        if (document.getElementById('setting-warn-mid-uses')) {
-            document.getElementById('setting-warn-mid-uses').value = cfg.warn_mid_uses || 35;
-        }
-        if (document.getElementById('setting-warn-empty')) {
-            document.getElementById('setting-warn-empty').value = cfg.warn_empty_cm || 0.5;
-        }
-        if (document.getElementById('setting-warn-empty-uses')) {
-            document.getElementById('setting-warn-empty-uses').value = cfg.warn_empty_uses || 15;
-        }
-        if (document.getElementById('setting-sensor-offset')) {
-            document.getElementById('setting-sensor-offset').value = cfg.sensor_offset_mm || 0;
-        }
-        updatePaperPreviewTable();
+
+        displaySelectedProfileData();
+        loadPaperAssignments();
     } catch (e) {
-        console.error("Error loading paper settings:", e);
+        console.error("Error loading paper profiles:", e);
     }
 }
 
-function updatePaperPreviewTable() {
-    const emptyDist = parseFloat(document.getElementById('setting-empty-dist')?.value) || 160;
-    const rollThick = parseFloat(document.getElementById('setting-roll-thick')?.value) || 110;
-    const sensorOffset = parseFloat(document.getElementById('setting-sensor-offset')?.value) || 0;
-    const warnLow = parseFloat(document.getElementById('setting-warn-low')?.value) || 1.5;
-    const warnLowUses = parseInt(document.getElementById('setting-warn-low-uses')?.value) || 60;
-    const warnMid = parseFloat(document.getElementById('setting-warn-mid')?.value) || 1.0;
-    const warnMidUses = parseInt(document.getElementById('setting-warn-mid-uses')?.value) || 35;
-    const warnEmpty = parseFloat(document.getElementById('setting-warn-empty')?.value) || 0.5;
-    const warnEmptyUses = parseInt(document.getElementById('setting-warn-empty-uses')?.value) || 15;
+function displaySelectedProfileData() {
+    const prof = currentPaperProfiles.find(p => p.id === currentSelectedPaperProfileId);
+    if (!prof) return;
 
-    const fullDist = Math.max(0, emptyDist - rollThick);
-    const distLow = Math.round(emptyDist - warnLow * 10);
-    const distMid = Math.round(emptyDist - warnMid * 10);
-    const distEmpty = Math.round(emptyDist - warnEmpty * 10);
-
-    const emptyBadge = document.getElementById('preview-empty-dist-calc');
-    if (emptyBadge) {
-        emptyBadge.innerHTML = `👉 Đo &ge; <strong>${emptyDist} mm</strong> &rarr; Báo Hết (0%)`;
+    if (document.getElementById('setting-profile-name')) {
+        document.getElementById('setting-profile-name').value = prof.name || '';
     }
-    const fullBadge = document.getElementById('preview-full-dist-calc');
-    if (fullBadge) {
-        fullBadge.innerHTML = `👉 Đo &le; <strong>${fullDist} mm</strong> (${emptyDist} - ${rollThick}) &rarr; Báo Đầy 100%`;
+    if (document.getElementById('setting-empty-dist')) {
+        document.getElementById('setting-empty-dist').value = prof.empty_distance_mm || 160;
     }
-    const offsetBadge = document.getElementById('preview-offset-calc');
-    if (offsetBadge) {
-        offsetBadge.innerHTML = `👉 Đang bù trừ: <strong>${sensorOffset} mm</strong>`;
+    if (document.getElementById('setting-roll-thick')) {
+        document.getElementById('setting-roll-thick').value = prof.roll_thickness_mm || 110;
     }
-
-    const tbody = document.getElementById('paper-auto-calc-table');
-    if (tbody) {
-        tbody.innerHTML = `
-            <tr style="border-bottom: 1px solid #f1f5f9;">
-                <td style="padding: 6px 10px;"><strong>${(rollThick/10).toFixed(1)} cm</strong> (Đầy nguyên cuộn)</td>
-                <td style="padding: 6px 10px; color: #166534; font-weight: 700;">Khoảng cách = ${fullDist} mm ${sensorOffset ? `<span style="font-size:0.7rem; color:#4338ca;">(gốc: ${fullDist + sensorOffset}mm)</span>` : ''}</td>
-                <td style="padding: 6px 10px; font-weight: 600;">~${Math.round(warnLowUses + ((rollThick/10 - warnLow)/0.5)*25)} lượt</td>
-                <td style="padding: 6px 10px;"><span class="status-pill OK" style="font-size: 0.7rem;">OK (Đầy giấy)</span></td>
-            </tr>
-            <tr style="border-bottom: 1px solid #f1f5f9; background: #f0fdf4;">
-                <td style="padding: 6px 10px;"><strong>&gt; ${warnLow} cm</strong> (Nhiều hơn ${warnLow} cm)</td>
-                <td style="padding: 6px 10px; color: #166534; font-weight: 700;">Khoảng cách &lt; ${distLow} mm ${sensorOffset ? `<span style="font-size:0.7rem; color:#4338ca;">(gốc: &lt; ${distLow + sensorOffset}mm)</span>` : ''}</td>
-                <td style="padding: 6px 10px; font-weight: 600;">&gt; ${warnLowUses} lượt</td>
-                <td style="padding: 6px 10px;"><span class="status-pill OK" style="font-size: 0.7rem;">OK (Không cảnh báo)</span></td>
-            </tr>
-            <tr style="border-bottom: 1px solid #f1f5f9; background: #fefce8;">
-                <td style="padding: 6px 10px;"><strong>&le; ${warnLow} cm</strong> (Còn ${warnLow} cm)</td>
-                <td style="padding: 6px 10px; color: #b45309; font-weight: 700;">Khoảng cách &ge; ${distLow} mm ${sensorOffset ? `<span style="font-size:0.7rem; color:#4338ca;">(gốc: &ge; ${distLow + sensorOffset}mm)</span>` : ''}</td>
-                <td style="padding: 6px 10px; font-weight: 600;">&approx; ${warnLowUses} lượt</td>
-                <td style="padding: 6px 10px;"><span class="status-pill LOW" style="font-size: 0.7rem;">LOW (Cảnh báo Sắp hết)</span></td>
-            </tr>
-            <tr style="border-bottom: 1px solid #f1f5f9; background: #fffbeb;">
-                <td style="padding: 6px 10px;"><strong>&le; ${warnMid} cm</strong> (Còn ${warnMid} cm)</td>
-                <td style="padding: 6px 10px; color: #b45309; font-weight: 700;">Khoảng cách &ge; ${distMid} mm ${sensorOffset ? `<span style="font-size:0.7rem; color:#4338ca;">(gốc: &ge; ${distMid + sensorOffset}mm)</span>` : ''}</td>
-                <td style="padding: 6px 10px; font-weight: 600;">&approx; ${warnMidUses} lượt</td>
-                <td style="padding: 6px 10px;"><span class="status-pill LOW" style="font-size: 0.7rem;">LOW (Cảnh báo Sắp hết)</span></td>
-            </tr>
-            <tr style="border-bottom: 1px solid #f1f5f9; background: #fef2f2;">
-                <td style="padding: 6px 10px;"><strong>&le; ${warnEmpty} cm</strong> (Còn ${warnEmpty} cm)</td>
-                <td style="padding: 6px 10px; color: #dc2626; font-weight: 700;">Khoảng cách &ge; ${distEmpty} mm ${sensorOffset ? `<span style="font-size:0.7rem; color:#4338ca;">(gốc: &ge; ${distEmpty + sensorOffset}mm)</span>` : ''}</td>
-                <td style="padding: 6px 10px; font-weight: 600;">&approx; ${warnEmptyUses} lượt</td>
-                <td style="padding: 6px 10px;"><span class="status-pill EMPTY" style="font-size: 0.7rem;">EMPTY (Cảnh báo Hết giấy)</span></td>
-            </tr>
-            <tr style="background: #fafafa;">
-                <td style="padding: 6px 10px;"><strong>0.0 cm</strong> (Hết sạch cuộn)</td>
-                <td style="padding: 6px 10px; color: #dc2626; font-weight: 700;">Khoảng cách &ge; ${emptyDist} mm ${sensorOffset ? `<span style="font-size:0.7rem; color:#4338ca;">(gốc: &ge; ${emptyDist + sensorOffset}mm)</span>` : ''}</td>
-                <td style="padding: 6px 10px; font-weight: 600;">0 lượt</td>
-                <td style="padding: 6px 10px;"><span class="status-pill EMPTY" style="font-size: 0.7rem;">EMPTY (Hết sạch)</span></td>
-            </tr>
-        `;
+    if (document.getElementById('setting-sensor-offset')) {
+        document.getElementById('setting-sensor-offset').value = prof.sensor_offset_mm || 0;
+    }
+    if (document.getElementById('setting-warn-low')) {
+        document.getElementById('setting-warn-low').value = prof.warn_low_cm || 1.5;
+    }
+    if (document.getElementById('setting-warn-low-uses')) {
+        document.getElementById('setting-warn-low-uses').value = prof.warn_low_uses || 60;
+    }
+    if (document.getElementById('setting-warn-mid')) {
+        document.getElementById('setting-warn-mid').value = prof.warn_mid_cm || 1.0;
+    }
+    if (document.getElementById('setting-warn-mid-uses')) {
+        document.getElementById('setting-warn-mid-uses').value = prof.warn_mid_uses || 35;
+    }
+    if (document.getElementById('setting-warn-empty')) {
+        document.getElementById('setting-warn-empty').value = prof.warn_empty_cm || 0.5;
+    }
+    if (document.getElementById('setting-warn-empty-uses')) {
+        document.getElementById('setting-warn-empty-uses').value = prof.warn_empty_uses || 15;
     }
 
-    testCalculateSensorDist();
+    const defaultBadge = document.getElementById('badge-profile-is-default');
+    if (defaultBadge) {
+        defaultBadge.style.display = prof.is_default ? 'inline-flex' : 'none';
+    }
+    const btnSetDefault = document.getElementById('btn-set-default-profile');
+    if (btnSetDefault) {
+        btnSetDefault.style.display = prof.is_default ? 'none' : 'inline-block';
+    }
+    const btnDelete = document.getElementById('btn-delete-profile');
+    if (btnDelete) {
+        btnDelete.disabled = prof.is_default;
+        btnDelete.title = prof.is_default ? 'Không thể xóa cấu hình mặc định' : 'Xóa cấu hình này';
+    }
+
+    updatePaperPreviewTable();
 }
 
-function testCalculateSensorDist() {
-    const emptyDist = parseFloat(document.getElementById('setting-empty-dist')?.value) || 160;
-    const rollThick = parseFloat(document.getElementById('setting-roll-thick')?.value) || 110;
-    const sensorOffset = parseFloat(document.getElementById('setting-sensor-offset')?.value) || 0;
-    const warnLow = parseFloat(document.getElementById('setting-warn-low')?.value) || 1.5;
-    const warnLowUses = parseInt(document.getElementById('setting-warn-low-uses')?.value) || 60;
-    const warnMid = parseFloat(document.getElementById('setting-warn-mid')?.value) || 1.0;
-    const warnMidUses = parseInt(document.getElementById('setting-warn-mid-uses')?.value) || 35;
-    const warnEmpty = parseFloat(document.getElementById('setting-warn-empty')?.value) || 0.5;
-    const warnEmptyUses = parseInt(document.getElementById('setting-warn-empty-uses')?.value) || 15;
-
-    const sensorDistInput = document.getElementById('test-sensor-dist');
-    const resEl = document.getElementById('test-sensor-result');
-    if (!resEl || !sensorDistInput) return;
-
-    const rawDist = parseFloat(sensorDistInput.value);
-    if (isNaN(rawDist) || rawDist < 0) {
-        resEl.innerHTML = '<span style="color: #64748b;">Nhập số mm hợp lệ...</span>';
-        return;
-    }
-
-    const sensorDist = Math.max(0, rawDist - sensorOffset);
-    let thickMm = (sensorDist >= emptyDist) ? 0 : (emptyDist - sensorDist);
-    if (thickMm > rollThick) thickMm = rollThick;
-    const thickCm = (thickMm / 10).toFixed(2);
-    const pct = ((thickMm / rollThick) * 100).toFixed(1);
-
-    let uses = 0;
-    const numThickCm = parseFloat(thickCm);
-    if (numThickCm <= 0) uses = 0;
-    else if (numThickCm <= warnEmpty) uses = Math.round((numThickCm / warnEmpty) * warnEmptyUses);
-    else if (numThickCm <= warnMid) uses = Math.round(warnEmptyUses + ((numThickCm - warnEmpty) / (warnMid - warnEmpty)) * (warnMidUses - warnEmptyUses));
-    else if (numThickCm <= warnLow) uses = Math.round(warnMidUses + ((numThickCm - warnMid) / (warnLow - warnMid)) * (warnLowUses - warnMidUses));
-    else uses = Math.round(warnLowUses + ((numThickCm - warnLow) / 0.5) * 25);
-
-    let stColor = '#166534', stText = 'Bình thường (OK) - Không cảnh báo';
-    if (numThickCm <= warnEmpty) {
-        stColor = '#dc2626'; stText = 'Cảnh báo HẾT GIẤY (EMPTY)';
-    } else if (numThickCm <= warnLow) {
-        stColor = '#b45309'; stText = 'Cảnh báo SẮP HẾT (LOW)';
-    }
-
-    resEl.innerHTML = `
-        <span>👉 Cảm biến đo: <strong>${rawDist} mm</strong> ${sensorOffset ? `(Bù trừ -${sensorOffset}mm = <strong>${sensorDist}mm</strong>)` : ''} &rarr; Độ dày giấy: <strong style="color: #0284c7;">${thickCm} cm</strong> (${pct}%) | Còn lại: <strong style="color: #0284c7;">~${uses} lượt dùng</strong> | Báo: <strong style="color: ${stColor};">${stText}</strong></span>
-    `;
+function onPaperProfileSelectChange() {
+    const selectEl = document.getElementById('paper-profile-select');
+    if (!selectEl) return;
+    currentSelectedPaperProfileId = parseInt(selectEl.value);
+    displaySelectedProfileData();
 }
 
 async function handleSavePaperSettings(e) {
     e.preventDefault();
+    if (!currentSelectedPaperProfileId) return;
+
+    const name = document.getElementById('setting-profile-name').value.trim();
     const emptyDist = parseFloat(document.getElementById('setting-empty-dist').value);
     const rollThick = parseFloat(document.getElementById('setting-roll-thick').value);
     const sensorOffset = parseFloat(document.getElementById('setting-sensor-offset').value) || 0;
@@ -2014,9 +2371,10 @@ async function handleSavePaperSettings(e) {
     const warnEmptyUses = parseInt(document.getElementById('setting-warn-empty-uses').value);
 
     try {
-        const res = await apiFetch('/api/admin/settings/paper', {
+        const res = await apiFetch(`/api/admin/paper/profiles/${currentSelectedPaperProfileId}`, {
             method: 'PUT',
             body: JSON.stringify({
+                name: name,
                 empty_distance_mm: emptyDist,
                 roll_thickness_mm: rollThick,
                 sensor_offset_mm: sensorOffset,
@@ -2030,9 +2388,17 @@ async function handleSavePaperSettings(e) {
         });
 
         if (res.ok) {
-            showToast("Đã lưu thông số cuộn giấy & bù trừ sai số thành công!", "OK");
-            updatePaperPreviewTable();
-            // If currently viewing a toilet, refresh details
+            showToast(`Đã lưu cấu hình [${name}] thành công!`, "OK");
+            await loadAdminPaperSettings();
+            // Refresh map markers and detail panel immediately
+            if (currentFloor) {
+                const flRes = await apiFetch(`/api/floors/${currentFloor.id}`);
+                if (flRes.ok) {
+                    const flData = await flRes.json();
+                    currentFloorToilets = flData.toilets || [];
+                    renderMarkers();
+                }
+            }
             if (selectedToiletId) {
                 selectToilet(selectedToiletId);
             }
@@ -2041,9 +2407,384 @@ async function handleSavePaperSettings(e) {
             alert(err.detail || "Không thể lưu cấu hình");
         }
     } catch (err) {
-        alert("Lỗi kết nối khi lưu cấu hình");
+        alert("Lỗi khi lưu cấu hình: " + err.message);
     }
 }
+
+function openCreatePaperProfileModal() {
+    document.getElementById('new-profile-name').value = '';
+    document.getElementById('new-profile-is-default').checked = false;
+    document.getElementById('modal-create-paper-profile').style.display = 'flex';
+}
+
+function closeCreatePaperProfileModal() {
+    document.getElementById('modal-create-paper-profile').style.display = 'none';
+}
+
+async function handleCreatePaperProfileSubmit(e) {
+    e.preventDefault();
+    const name = document.getElementById('new-profile-name').value.trim();
+    const copyFromId = parseInt(document.getElementById('new-profile-copy-from').value);
+    const isDefault = document.getElementById('new-profile-is-default').checked;
+
+    const sourceProfile = currentPaperProfiles.find(p => p.id === copyFromId) || {};
+
+    try {
+        const res = await apiFetch('/api/admin/paper/profiles', {
+            method: 'POST',
+            body: JSON.stringify({
+                name: name,
+                is_default: isDefault,
+                empty_distance_mm: sourceProfile.empty_distance_mm || 160,
+                roll_thickness_mm: sourceProfile.roll_thickness_mm || 110,
+                sensor_offset_mm: sourceProfile.sensor_offset_mm || 40,
+                warn_low_cm: sourceProfile.warn_low_cm || 1.5,
+                warn_low_uses: sourceProfile.warn_low_uses || 60,
+                warn_mid_cm: sourceProfile.warn_mid_cm || 1.0,
+                warn_mid_uses: sourceProfile.warn_mid_uses || 35,
+                warn_empty_cm: sourceProfile.warn_empty_cm || 0.5,
+                warn_empty_uses: sourceProfile.warn_empty_uses || 15
+            })
+        });
+
+        if (res.ok) {
+            const newP = await res.json();
+            showToast(`Đã tạo cấu hình [${newP.name}] thành công!`, "OK");
+            closeCreatePaperProfileModal();
+            currentSelectedPaperProfileId = newP.id;
+            await loadAdminPaperSettings();
+        } else {
+            const err = await res.json();
+            alert(err.detail || "Không thể tạo cấu hình");
+        }
+    } catch (err) {
+        alert("Lỗi khi tạo cấu hình: " + err.message);
+    }
+}
+
+async function handleSetDefaultProfile() {
+    if (!currentSelectedPaperProfileId) return;
+    const prof = currentPaperProfiles.find(p => p.id === currentSelectedPaperProfileId);
+    if (!confirm(`Bạn có chắc chắn muốn đặt cấu hình [${prof ? prof.name : ''}] làm MẶC ĐỊNH cho toàn hệ thống không?
+(Tất cả WC và Cabin không gán riêng sẽ tự động dùng cấu hình này)`)) {
+        return;
+    }
+
+    try {
+        const res = await apiFetch(`/api/admin/paper/profiles/${currentSelectedPaperProfileId}/set-default`, {
+            method: 'POST'
+        });
+        if (res.ok) {
+            showToast(`Đã đặt cấu hình mặc định toàn hệ thống!`, "OK");
+            await loadAdminPaperSettings();
+        } else {
+            const err = await res.json();
+            alert(err.detail || "Không thể đặt làm mặc định");
+        }
+    } catch (err) {
+        alert("Lỗi: " + err.message);
+    }
+}
+
+async function handleDeletePaperProfile() {
+    if (!currentSelectedPaperProfileId) return;
+    const prof = currentPaperProfiles.find(p => p.id === currentSelectedPaperProfileId);
+    if (!prof) return;
+
+    if (!confirm(`Bạn có chắc chắn muốn xóa cấu hình cuộn giấy [${prof.name}]?
+Các WC và Cabin đang dùng cấu hình này sẽ tự động chuyển về cấu hình mặc định của hệ thống.`)) {
+        return;
+    }
+
+    try {
+        const res = await apiFetch(`/api/admin/paper/profiles/${currentSelectedPaperProfileId}`, {
+            method: 'DELETE'
+        });
+        if (res.ok) {
+            showToast(`Đã xóa cấu hình cuộn giấy thành công!`, "OK");
+            currentSelectedPaperProfileId = null;
+            await loadAdminPaperSettings();
+        } else {
+            const err = await res.json();
+            alert(err.detail || "Không thể xóa cấu hình");
+        }
+    } catch (err) {
+        alert("Lỗi khi xóa: " + err.message);
+    }
+}
+
+function switchPaperSubTab(tab) {
+    const paramsDiv = document.getElementById('subtab-paper-params');
+    const assignDiv = document.getElementById('subtab-paper-assign');
+    const paramsBtn = document.getElementById('subtab-paper-params-btn');
+    const assignBtn = document.getElementById('subtab-paper-assign-btn');
+
+    if (tab === 'params') {
+        if (paramsDiv) paramsDiv.style.display = 'block';
+        if (assignDiv) assignDiv.style.display = 'none';
+        if (paramsBtn) {
+            paramsBtn.style.borderBottom = '2px solid #2563eb';
+            paramsBtn.style.color = '#2563eb';
+            paramsBtn.style.fontWeight = '700';
+        }
+        if (assignBtn) {
+            assignBtn.style.borderBottom = 'none';
+            assignBtn.style.color = '#64748b';
+            assignBtn.style.fontWeight = '600';
+        }
+    } else {
+        if (paramsDiv) paramsDiv.style.display = 'none';
+        if (assignDiv) assignDiv.style.display = 'block';
+        if (assignBtn) {
+            assignBtn.style.borderBottom = '2px solid #2563eb';
+            assignBtn.style.color = '#2563eb';
+            assignBtn.style.fontWeight = '700';
+        }
+        if (paramsBtn) {
+            paramsBtn.style.borderBottom = 'none';
+            paramsBtn.style.color = '#64748b';
+            paramsBtn.style.fontWeight = '600';
+        }
+        loadPaperAssignments();
+    }
+}
+
+// ================= HIERARCHICAL ASSIGNMENT MANAGEMENT =================
+async function loadPaperAssignments() {
+    try {
+        const res = await apiFetch('/api/admin/paper/assignments');
+        if (!res.ok) return;
+        paperAssignmentsData = await res.json();
+        renderPaperAssignmentsTable();
+    } catch (e) {
+        console.error("Error loading paper assignments:", e);
+    }
+}
+
+function filterPaperAssignmentsTable() {
+    const text = (document.getElementById('paper-assign-filter-input')?.value || '').toLowerCase().trim();
+    renderPaperAssignmentsTable(text);
+}
+
+function renderPaperAssignmentsTable(filterText = '') {
+    const tbody = document.getElementById('paper-assign-table-body');
+    if (!tbody) return;
+    tbody.innerHTML = '';
+
+    if (!paperAssignmentsData || paperAssignmentsData.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="3" style="text-align: center; padding: 2rem; color: #64748b;">Chưa có dữ liệu nhà ga hoặc WC nào.</td></tr>';
+        return;
+    }
+
+    const defaultProfile = currentPaperProfiles.find(p => p.is_default);
+
+    paperAssignmentsData.forEach(term => {
+        term.floors.forEach(fl => {
+            fl.toilets.forEach(t => {
+                const matchesFilter = !filterText || 
+                    term.terminal_name.toLowerCase().includes(filterText) ||
+                    fl.floor_name.toLowerCase().includes(filterText) ||
+                    t.toilet_name.toLowerCase().includes(filterText) ||
+                    t.cabins.some(c => c.label.toLowerCase().includes(filterText) || c.mac_address.toLowerCase().includes(filterText));
+
+                if (!matchesFilter) return;
+
+                // 1. RENDER WC ROW
+                const wcRow = document.createElement('tr');
+                wcRow.style.cssText = 'background: #f8fafc; border-top: 2px solid #cbd5e1; border-bottom: 1px solid #e2e8f0;';
+                
+                const wcOptionsHtml = `
+                    <option value="" ${!t.paper_profile_id ? 'selected' : ''}>[Dùng Mặc định toàn hệ thống: ${defaultProfile ? defaultProfile.name : ''}]</option>
+                    ${currentPaperProfiles.map(p => `
+                        <option value="${p.id}" ${t.paper_profile_id === p.id ? 'selected' : ''}>${p.name} ${p.is_default ? '(Mặc định)' : ''}</option>
+                    `).join('')}
+                `;
+
+                const wcEffectiveBadge = t.paper_profile_id 
+                    ? `<span class="badge" style="background: #e0f2fe; color: #0369a1; border: 1px solid #7dd3fc; font-weight: 700; padding: 3px 8px;">🏢 ${t.effective_profile_name} (Riêng WC)</span>`
+                    : `<span class="badge" style="background: #f1f5f9; color: #475569; border: 1px solid #cbd5e1; font-weight: 600; padding: 3px 8px;">⚙️ ${t.effective_profile_name}</span>`;
+
+                wcRow.innerHTML = `
+                    <td style="padding: 0.75rem 1rem;">
+                        <div style="display: flex; align-items: center; gap: 0.5rem;">
+                            <span style="font-size: 1.15rem;">🏢</span>
+                            <div>
+                                <strong style="color: #0f172a; font-size: 0.95rem;">${escapeHtml(t.toilet_name)}</strong>
+                                <div style="font-size: 0.75rem; color: #64748b;">${escapeHtml(term.terminal_name)} • ${escapeHtml(fl.floor_name)} • ${t.cabins.length} Cabin</div>
+                            </div>
+                        </div>
+                    </td>
+                    <td style="padding: 0.75rem 1rem;">
+                        <select onchange="handleAssignPaperProfile('toilet', ${t.toilet_id}, this.value)" style="width: 100%; padding: 0.35rem 0.6rem; border-radius: 6px; border: 1px solid #94a3b8; font-size: 0.82rem; background: white; font-weight: 600;">
+                            ${wcOptionsHtml}
+                        </select>
+                        <div style="font-size: 0.7rem; color: #64748b; margin-top: 2px;">
+                            👉 Sẽ áp dụng cho tất cả cabin trong WC này
+                        </div>
+                    </td>
+                    <td style="padding: 0.75rem 1.25rem;">
+                        ${wcEffectiveBadge}
+                    </td>
+                `;
+                tbody.appendChild(wcRow);
+
+                // 2. RENDER CABIN ROWS
+                t.cabins.forEach(c => {
+                    const cabinRow = document.createElement('tr');
+                    cabinRow.style.cssText = 'border-bottom: 1px solid #f1f5f9; background: white; transition: background 0.15s;';
+                    cabinRow.onmouseover = () => cabinRow.style.background = '#fcfdfe';
+                    cabinRow.onmouseout = () => cabinRow.style.background = 'white';
+
+                    const cabinOptionsHtml = `
+                        <option value="" ${!c.paper_profile_id ? 'selected' : ''}>[Kế thừa theo WC: ${t.paper_profile_name || (defaultProfile ? defaultProfile.name : 'Mặc định')}]</option>
+                        ${currentPaperProfiles.map(p => `
+                            <option value="${p.id}" ${c.paper_profile_id === p.id ? 'selected' : ''}>${p.name} ${p.is_default ? '(Mặc định)' : ''}</option>
+                        `).join('')}
+                    `;
+
+                    let cabinBadge = '';
+                    if (c.source === 'DEVICE') {
+                        cabinBadge = `<span class="badge" style="background: #f0fdf4; color: #166534; border: 1px solid #86efac; font-weight: 700; padding: 2px 7px;">🚪 ${c.effective_profile_name} (Riêng Cabin)</span>`;
+                    } else if (c.source === 'TOILET') {
+                        cabinBadge = `<span class="badge" style="background: #eff6ff; color: #1e40af; border: 1px solid #bfdbfe; font-weight: 600; padding: 2px 7px;">↳ Kế thừa WC: ${c.effective_profile_name}</span>`;
+                    } else {
+                        cabinBadge = `<span class="badge" style="background: #f8fafc; color: #64748b; border: 1px solid #e2e8f0; font-weight: 500; padding: 2px 7px;">↳ ${c.effective_profile_name}</span>`;
+                    }
+
+                    cabinRow.innerHTML = `
+                        <td style="padding: 0.55rem 1rem 0.55rem 2.25rem;">
+                            <div style="display: flex; align-items: center; gap: 0.5rem;">
+                                <span style="color: #cbd5e1; font-weight: bold; user-select: none;">└─</span>
+                                <span class="badge" style="background: #e0f2fe; color: #0369a1; font-weight: 700; padding: 2px 6px; font-size: 0.72rem;">#${c.cabin_order || 1}</span>
+                                <div>
+                                    <strong style="color: #334155; font-size: 0.88rem;">${escapeHtml(c.label)}</strong>
+                                    <code style="font-size: 0.75rem; color: #64748b; margin-left: 6px;">${c.mac_address}</code>
+                                </div>
+                            </div>
+                        </td>
+                        <td style="padding: 0.55rem 1rem;">
+                            <select onchange="handleAssignPaperProfile('device', ${c.device_id}, this.value)" style="width: 100%; padding: 0.3rem 0.5rem; border-radius: 4px; border: 1px solid #cbd5e1; font-size: 0.8rem; background: ${c.paper_profile_id ? '#f0fdf4' : 'white'};">
+                                ${cabinOptionsHtml}
+                            </select>
+                        </td>
+                        <td style="padding: 0.55rem 1.25rem;">
+                            ${cabinBadge}
+                        </td>
+                    `;
+                    tbody.appendChild(cabinRow);
+                });
+            });
+        });
+    });
+}
+
+async function handleAssignPaperProfile(targetType, targetId, profileIdVal) {
+    const profileId = profileIdVal ? parseInt(profileIdVal) : null;
+    try {
+        const res = await apiFetch('/api/admin/paper/assign', {
+            method: 'POST',
+            body: JSON.stringify({
+                target_type: targetType,
+                target_id: targetId,
+                profile_id: profileId
+            })
+        });
+
+        if (res.ok) {
+            showToast("Đã cập nhật phân bổ cấu hình cuộn giấy thành công!", "OK");
+            await loadPaperAssignments();
+            // Refresh profiles count
+            const profRes = await apiFetch('/api/admin/paper/profiles');
+            if (profRes.ok) currentPaperProfiles = await profRes.json();
+            // Refresh map markers and detail panel immediately
+            if (currentFloor) {
+                const flRes = await apiFetch(`/api/floors/${currentFloor.id}`);
+                if (flRes.ok) {
+                    const flData = await flRes.json();
+                    currentFloorToilets = flData.toilets || [];
+                    renderMarkers();
+                }
+            }
+            if (selectedToiletId) selectToilet(selectedToiletId);
+        } else {
+            const err = await res.json();
+            alert(err.detail || "Không thể phân bổ cấu hình");
+        }
+    } catch (e) {
+        alert("Lỗi khi gán cấu hình: " + e.message);
+    }
+}
+
+// ================= EXPORT & IMPORT CONFIG =================
+async function exportPaperConfigs() {
+    try {
+        const res = await apiFetch('/api/admin/paper/export');
+        if (!res.ok) {
+            alert("Không thể xuất file cấu hình");
+            return;
+        }
+        const data = await res.json();
+        const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(data, null, 2));
+        const downloadAnchor = document.createElement('a');
+        const now = new Date();
+        const dateStr = now.toISOString().slice(0, 10).replace(/-/g, '');
+        downloadAnchor.setAttribute("href", dataStr);
+        downloadAnchor.setAttribute("download", `cau_hinh_cuon_giay_san_bay_${dateStr}.json`);
+        document.body.appendChild(downloadAnchor);
+        downloadAnchor.click();
+        downloadAnchor.remove();
+        showToast("Đã xuất file cấu hình cuộn giấy thành công!", "OK");
+    } catch (e) {
+        alert("Lỗi khi xuất file: " + e.message);
+    }
+}
+
+function triggerImportPaperConfig() {
+    const fileInput = document.getElementById('paper-import-file-input');
+    if (fileInput) fileInput.click();
+}
+
+async function handlePaperConfigFileSelected(event) {
+    const file = event.target.files && event.target.files[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = async function(e) {
+        try {
+            const parsed = JSON.parse(e.target.result);
+            if (!parsed.profiles || !Array.isArray(parsed.profiles)) {
+                alert("File JSON không hợp lệ hoặc thiếu mục 'profiles'");
+                return;
+            }
+
+            if (!confirm(`Bạn có chắc chắn muốn nạp file cấu hình này không?
+File chứa ${parsed.profiles.length} cấu hình cuộn giấy.`)) {
+                event.target.value = '';
+                return;
+            }
+
+            const res = await apiFetch('/api/admin/paper/import', {
+                method: 'POST',
+                body: JSON.stringify(parsed)
+            });
+
+            if (res.ok) {
+                const report = await res.json();
+                showToast(`Nhập cấu hình thành công: Đã thêm ${report.created_profiles_count || 0}, cập nhật ${report.updated_profiles_count || 0} cấu hình!`, "OK");
+                await loadAdminPaperSettings();
+            } else {
+                const err = await res.json();
+                alert(err.detail || "Không thể nhập cấu hình từ file");
+            }
+        } catch (err) {
+            alert("Lỗi phân tích cú pháp file JSON: " + err.message);
+        } finally {
+            event.target.value = '';
+        }
+    };
+    reader.readAsText(file);
+}
+
 
 // Users Management
 async function loadAdminUsers() {
@@ -2194,88 +2935,538 @@ async function handleUploadMap(e) {
     }
 }
 
-// Gateways & Devices Management
+// Gateways & Devices Management (Parent - Child Hierarchy)
+let collapsedGateways = new Set();
+let currentAdminGateways = [];
+let currentAdminDevices = [];
+let currentDiscoveredMap = {};
+
 async function loadAdminGateways() {
+    const container = document.getElementById('admin-gateways-tree-container');
     try {
         const res = await apiFetch('/api/admin/gateways');
-        if (!res.ok) return;
-        const gateways = await res.json();
+        if (!res.ok) {
+            if (container) container.innerHTML = '<div class="alert alert-danger" style="margin: 1rem 0;">Không thể tải danh sách Gateway</div>';
+            return;
+        }
+        currentAdminGateways = await res.json();
 
-        let discoveredMap = {};
         try {
             const discRes = await apiFetch('/api/gateways/discovered');
             if (discRes.ok) {
-                discoveredMap = await discRes.json();
+                currentDiscoveredMap = await discRes.json();
             }
-        } catch (e) {}
+        } catch (e) {
+            currentDiscoveredMap = {};
+        }
 
-        const tbody = document.getElementById('admin-gateways-table');
-        tbody.innerHTML = '';
-        gateways.forEach(gw => {
-            const discList = discoveredMap[gw.ip_address] || [];
-            let discBadge = '';
-            if (discList.length > 0) {
-                discBadge = `<br><span class="badge-live-pulse" style="margin-top: 3px; font-size: 0.65rem;" title="${discList.map(c => c.mac_address).join(', ')}">📡 +${discList.length} client mới</span>`;
+        try {
+            const devRes = await apiFetch('/api/admin/devices');
+            if (devRes.ok) {
+                currentAdminDevices = await devRes.json();
             }
-
-            // Tag CHỜ GÁN nếu Gateway chưa được gán vào Toilet nào (để màu xám)
-            const newTag = gw.is_new 
-                ? `<span style="background: #f1f5f9; color: #475569; border: 1px solid #cbd5e1; padding: 2px 6px; border-radius: 4px; font-size: 0.72rem; font-weight: 600; margin-left: 6px; display: inline-block;">CHỜ GÁN</span>` 
-                : '';
-
-            // Trạng thái: Những gateway KHÔNG ĐƯỢC GÁN vào WC thì để màu xám (⚪)
-            // Chỉ những cái nào ĐÃ GÁN VÀ CÓ TÍN HIỆU ĐANG ĐƯỢC SỬ DỤNG mới để màu xanh (🟢)
-            let statusBadge = '';
-            if (gw.is_new) {
-                // Chưa gán địa chỉ / vị trí -> màu xám
-                statusBadge = gw.is_online
-                    ? `<span style="background: #f8fafc; color: #475569; border: 1px solid #cbd5e1; padding: 2px 8px; border-radius: 9999px; font-size: 0.75rem; font-weight: 600;">⚪ Có tín hiệu (Chưa gán)</span>`
-                    : `<span style="background: #f8fafc; color: #94a3b8; border: 1px solid #e2e8f0; padding: 2px 8px; border-radius: 9999px; font-size: 0.75rem; font-weight: 600;">⚪ Mất kết nối (Chưa gán)</span>`;
-            } else {
-                // Đã gán vào nhà vệ sinh
-                statusBadge = gw.is_online
-                    ? `<span style="background: #dcfce7; color: #15803d; border: 1px solid #86efac; padding: 2px 8px; border-radius: 9999px; font-size: 0.75rem; font-weight: 600;">🟢 Online</span>`
-                    : `<span style="background: #fee2e2; color: #b91c1c; border: 1px solid #fecaca; padding: 2px 8px; border-radius: 9999px; font-size: 0.75rem; font-weight: 600;">🔴 Mất kết nối</span>`;
-            }
-
-            // Nút hành động: Nếu chưa gán toilet thì gợi ý thêm vị trí lên Map
-            const actionBtn = gw.is_new
-                ? `<button class="btn btn-primary btn-sm" style="margin-right: 4px;" onclick="assignGatewayToMap('${gw.ip_address}')">📍 Đặt lên Map</button>`
-                : '';
-
-            const tr = document.createElement('tr');
-            tr.innerHTML = `
-                <td>${gw.id}</td>
-                <td><strong>${gw.ip_address}</strong> ${newTag}</td>
-                <td id="gw-status-badge-${gw.id}">${statusBadge}</td>
-                <td><strong style="color: #2563eb;">${gw.terminal_name}</strong></td>
-                <td>${gw.floor_name}</td>
-                <td>${gw.toilet_name}</td>
-                <td>${gw.device_count} ${discBadge}</td>
-                <td id="gw-last-seen-${gw.id}">${gw.last_seen ? new Date(gw.last_seen).toLocaleTimeString('vi-VN') : 'Chưa có'}</td>
-                <td>
-                    ${actionBtn}
-                    <button class="btn btn-secondary btn-sm" id="btn-ping-gw-${gw.id}" style="margin-right: 4px;" onclick="checkAdminGateway('${gw.ip_address}', ${gw.id}, ${gw.is_new ? 'true' : 'false'}, this)" title="Kiểm tra tín hiệu Gateway này">🔍 Kiểm tra</button>
-                    <button class="btn btn-danger btn-sm" onclick="handleDeleteGateway(${gw.id})">Xoá</button>
-                </td>
-            `;
-            tbody.appendChild(tr);
-        });
+        } catch (e) {
+            currentAdminDevices = [];
+        }
 
         // Also populate select options in device edit form
         const gwSelect = document.getElementById('form-device-gw');
-        gwSelect.innerHTML = '';
-        gateways.forEach(gw => {
-            const opt = document.createElement('option');
-            opt.value = gw.id;
-            opt.innerText = `${gw.ip_address} (${gw.toilet_name})`;
-            gwSelect.appendChild(opt);
+        if (gwSelect) {
+            gwSelect.innerHTML = '';
+            currentAdminGateways.forEach(gw => {
+                const opt = document.createElement('option');
+                opt.value = gw.id;
+                opt.innerText = `${gw.mac_address || gw.ip_address} (${gw.toilet_name || 'Chưa gán'})`;
+                gwSelect.appendChild(opt);
+            });
+        }
+
+        renderAdminGatewaysTree();
+    } catch (err) {
+        console.error("Error loading gateways:", err);
+        if (container) {
+            container.innerHTML = `<div class="alert alert-danger" style="margin: 1rem 0;">Lỗi kết nối máy chủ: ${escapeHtml(err.message)}</div>`;
+        }
+    }
+}
+
+async function loadAdminDevices() {
+    await loadAdminGateways();
+}
+
+function updateGatewayTreeFromWs(data) {
+    if (!currentAdminGateways || currentAdminGateways.length === 0) {
+        // If admin gateways tab is active, fetch list
+        const tabEl = document.getElementById('admin-tab-gateways');
+        if (tabEl && tabEl.style.display !== 'none') {
+            loadAdminGateways();
+        }
+        return;
+    }
+
+    // Find the gateway in memory
+    const targetGw = currentAdminGateways.find(gw => 
+        (data.gateway_id && gw.id === data.gateway_id) ||
+        (data.gateway_mac && gw.mac_address && gw.mac_address.toUpperCase() === data.gateway_mac.toUpperCase()) ||
+        (data.toilet_id && gw.toilet_id === data.toilet_id) ||
+        (data.gateway_ip && gw.ip_address === data.gateway_ip)
+    );
+
+    if (!targetGw) return;
+
+    // Update in-memory data
+    const isOnline = (data.gateway_online !== undefined) ? data.gateway_online : (data.is_online !== undefined ? data.is_online : true);
+    targetGw.is_online = isOnline;
+    targetGw.status = isOnline ? "ONLINE" : "OFFLINE";
+    if (data.last_seen) {
+        targetGw.last_seen = data.last_seen;
+    } else {
+        targetGw.last_seen = new Date().toISOString();
+    }
+    if (data.gateway_ip) {
+        targetGw.ip_address = data.gateway_ip;
+    }
+    if (data.toilet_name) {
+        targetGw.toilet_name = data.toilet_name;
+    }
+    if (data.floor_name) {
+        targetGw.floor_name = data.floor_name;
+    }
+    if (data.terminal_name) {
+        targetGw.terminal_name = data.terminal_name;
+    }
+    const tSt = data.toilet_status || data.status;
+    if (tSt) {
+        targetGw.toilet_status = tSt;
+    }
+    if (data.toilet_min_paper !== undefined && data.toilet_min_paper !== null) {
+        targetGw.toilet_min_paper = data.toilet_min_paper;
+    } else if (data.devices && data.devices.length > 0) {
+        targetGw.toilet_min_paper = Math.min(...data.devices.map(d => d.paper_level));
+    }
+    if (data.devices) {
+        targetGw.devices = data.devices;
+        targetGw.device_count = data.devices.length;
+    }
+    if (data.discovered_devices) {
+        if (targetGw.ip_address) currentDiscoveredMap[targetGw.ip_address] = data.discovered_devices;
+        if (targetGw.mac_address) currentDiscoveredMap[targetGw.mac_address] = data.discovered_devices;
+    }
+
+    // Always re-render the admin tree if admin gateways tab is active or container exists
+    const container = document.getElementById('admin-gateways-tree-container');
+    const tabEl = document.getElementById('admin-tab-gateways');
+    if (container && (!tabEl || tabEl.style.display !== 'none')) {
+        renderAdminGatewaysTree();
+    }
+}
+
+function renderAdminGatewaysTree() {
+    const container = document.getElementById('admin-gateways-tree-container');
+    if (!container) return;
+    container.innerHTML = '';
+
+    if (!currentAdminGateways || currentAdminGateways.length === 0) {
+        container.innerHTML = `
+            <div style="background: white; border-radius: 8px; border: 1px dashed var(--border-color); padding: 3rem 1.5rem; text-align: center; color: var(--text-secondary);">
+                <div style="font-size: 2.5rem; margin-bottom: 0.5rem;">📡</div>
+                <h4 style="color: var(--text-primary); margin-bottom: 0.5rem; font-size: 1.1rem;">Chưa có Gateway nào trong hệ thống</h4>
+                <p style="font-size: 0.9rem; margin-bottom: 1.25rem;">Hãy nhập địa chỉ MAC phần cứng của ESP32 Gateway ở trên để thêm Gateway đầu tiên.</p>
+            </div>
+        `;
+        return;
+    }
+
+    const assignedDeviceIds = new Set();
+
+    currentAdminGateways.forEach(gw => {
+        const isCollapsed = collapsedGateways.has(gw.id);
+        const card = document.createElement('div');
+        card.className = 'gateway-group-card';
+        card.style.cssText = 'background: white; border-radius: 8px; border: 1px solid var(--border-color); margin-bottom: 1.25rem; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.05);';
+
+        const devs = gw.devices || (currentAdminDevices ? currentAdminDevices.filter(d => d.gateway_id === gw.id) : []);
+        devs.forEach(d => assignedDeviceIds.add(d.id));
+
+        // Discovered clients broadcasting to this Gateway
+        const discFromGw = gw.discovered_devices || [];
+        const discListByIp = gw.ip_address ? (currentDiscoveredMap[gw.ip_address] || []) : [];
+        const discListByMac = gw.mac_address ? (currentDiscoveredMap[gw.mac_address.toUpperCase()] || currentDiscoveredMap[gw.mac_address] || []) : [];
+        const discListById = gw.id ? (currentDiscoveredMap[String(gw.id)] || currentDiscoveredMap[gw.id] || []) : [];
+        const discListByAll = (currentDiscoveredMap["_all"] || []).filter(c => 
+            (c.gateway_id && c.gateway_id === gw.id) ||
+            (c.gateway_mac && gw.mac_address && c.gateway_mac.toUpperCase() === gw.mac_address.toUpperCase()) ||
+            (c.gateway_ip && gw.ip_address && c.gateway_ip === gw.ip_address) ||
+            (c.toilet_id && gw.toilet_id && c.toilet_id === gw.toilet_id)
+        );
+        const combinedDisc = [...discFromGw, ...discListByIp, ...discListByMac, ...discListById, ...discListByAll];
+        const savedMacs = new Set(devs.map(d => (d.mac_address || '').toUpperCase()));
+        const uniqueDisc = [];
+        const seenMac = new Set();
+        combinedDisc.forEach(c => {
+            const cm = (c.mac_address || '').toUpperCase();
+            if (!savedMacs.has(cm) && !seenMac.has(cm)) {
+                seenMac.add(cm);
+                uniqueDisc.push(c);
+            }
         });
-    } catch (err) {}
+
+        // Status Badge
+        let statusBadge = '';
+        if (gw.is_new) {
+            statusBadge = gw.is_online
+                ? `<span id="gw-status-badge-${gw.id}" style="background: #f8fafc; color: #475569; border: 1px solid #cbd5e1; padding: 3px 8px; border-radius: 9999px; font-size: 0.75rem; font-weight: 600;">⚪ Có tín hiệu (Chưa gán)</span>`
+                : `<span id="gw-status-badge-${gw.id}" style="background: #f8fafc; color: #94a3b8; border: 1px solid #e2e8f0; padding: 3px 8px; border-radius: 9999px; font-size: 0.75rem; font-weight: 600;">⚪ Mất kết nối (Chưa gán)</span>`;
+        } else {
+            statusBadge = gw.is_online
+                ? `<span id="gw-status-badge-${gw.id}" style="background: #dcfce7; color: #15803d; border: 1px solid #86efac; padding: 3px 8px; border-radius: 9999px; font-size: 0.75rem; font-weight: 600;">🟢 Online</span>`
+                : `<span id="gw-status-badge-${gw.id}" style="background: #fee2e2; color: #b91c1c; border: 1px solid #fecaca; padding: 3px 8px; border-radius: 9999px; font-size: 0.75rem; font-weight: 600;">🔴 Mất kết nối</span>`;
+        }
+
+        // Live pulse badge
+        let discBadge = '';
+        if (uniqueDisc.length > 0) {
+            discBadge = `<span class="badge-live-pulse" style="margin-left: 6px; font-size: 0.72rem;" title="${uniqueDisc.map(c => c.mac_address).join(', ')}">📡 +${uniqueDisc.length} client mới</span>`;
+        }
+
+        // WC Status Badge (Đầy đủ, Sắp hết, Hết giấy, Mất kết nối)
+        let wcStatusBadge = '';
+        if (gw.toilet_name && gw.toilet_name !== 'Chưa gán') {
+            const tSt = gw.toilet_status || (gw.is_online ? 'OK' : 'OFFLINE');
+            let pillClass = 'status-pill OK';
+            let pillLabel = '● Đầy đủ';
+            if (tSt === 'DANGER' || tSt === 'EMPTY') {
+                pillClass = 'status-pill DANGER';
+                pillLabel = '● Hết giấy';
+            } else if (tSt === 'WARNING' || tSt === 'LOW') {
+                pillClass = 'status-pill WARNING';
+                pillLabel = '● Sắp hết';
+            } else if (tSt === 'OFFLINE' || !gw.is_online) {
+                pillClass = 'status-pill OFFLINE';
+                pillLabel = '● Mất kết nối';
+            }
+            const minPaperText = (gw.toilet_min_paper !== undefined && gw.toilet_min_paper !== null && tSt !== 'OFFLINE') 
+                ? ` (${Math.round(gw.toilet_min_paper)}%)` 
+                : '';
+            wcStatusBadge = `<span id="gw-wc-status-${gw.id}" class="${pillClass}" style="margin-left: 6px; font-size: 0.72rem; padding: 2px 8px; font-weight: 600;">${pillLabel}${minPaperText}</span>`;
+        }
+
+        // Discovered banner inside card body
+        let discBannerHtml = '';
+        if (uniqueDisc.length > 0) {
+            discBannerHtml = `
+                <div style="background: #ecfdf5; border-left: 4px solid #10b981; border-bottom: 1px solid #a7f3d0; padding: 0.75rem 1.25rem;">
+                    <div style="font-size: 0.85rem; font-weight: 600; color: #065f46; margin-bottom: 0.4rem; display: flex; align-items: center; justify-content: space-between;">
+                        <span>📡 Phát hiện ${uniqueDisc.length} Client ESP đang truyền dữ liệu tới Gateway này (chưa lưu vào CSDL):</span>
+                    </div>
+                    <div style="display: flex; flex-direction: column; gap: 0.4rem;">
+                        ${uniqueDisc.map(c => `
+                            <div style="background: white; border: 1px solid #a7f3d0; border-radius: 6px; padding: 0.4rem 0.75rem; display: flex; justify-content: space-between; align-items: center; font-size: 0.82rem;">
+                                <div>
+                                    • MAC: <code style="font-weight: 700; color: #047857;">${c.mac_address}</code> | Giấy: <strong>${Math.round(c.paper_level)}%</strong> ${c.distance !== null && c.distance !== undefined ? `(${c.distance} mm)` : ''} | Pin: <strong>${Math.round(c.battery)}%</strong>
+                                </div>
+                                <div style="display: flex; gap: 0.35rem;">
+                                    <button class="btn btn-primary btn-sm" onclick="openAddCabinForGateway(${gw.id}, ${gw.toilet_id}, '${c.mac_address}')" style="padding: 2px 8px; font-size: 0.75rem;">➕ Lưu Client</button>
+                                    <button class="btn btn-danger btn-sm" onclick="handleDeleteDiscoveredClient('${c.mac_address}', ${gw.id}, ${gw.toilet_id})" style="padding: 2px 8px; font-size: 0.75rem;" title="Xóa client mới phát hiện này">🗑️ Xóa</button>
+                                </div>
+                            </div>
+                        `).join('')}
+                    </div>
+                </div>
+            `;
+        }
+
+        // Child devices table HTML
+        let devicesHtml = '';
+        if (devs.length === 0) {
+            devicesHtml = `
+                <div style="padding: 1.5rem 2.5rem; text-align: center; color: var(--text-secondary); background: #fafbfc; border-top: 1px solid #f1f5f9;">
+                    <p style="margin: 0 0 0.5rem 0; font-size: 0.9rem;">Gateway này chưa có thiết bị ESP (Cabin) nào.</p>
+                    <button class="btn btn-secondary btn-sm" onclick="openAddCabinForGateway(${gw.id}, ${gw.toilet_id})">➕ Thêm thiết bị Cabin đầu tiên</button>
+                </div>
+            `;
+        } else {
+            let deviceRows = '';
+            devs.forEach(d => {
+                const paperPct = Math.round(d.paper_level);
+                let paperColor = '#10b981';
+                if (d.status === 'DANGER' || paperPct <= 10) paperColor = '#ef4444';
+                else if (d.status === 'WARNING' || paperPct <= 25) paperColor = '#f59e0b';
+
+                let statusPill = '';
+                if (d.status === 'DANGER') {
+                    statusPill = `<span class="status-pill DANGER">● Hết giấy</span>`;
+                } else if (d.status === 'WARNING') {
+                    statusPill = `<span class="status-pill WARNING">● Sắp hết</span>`;
+                } else if (d.status === 'OK') {
+                    statusPill = `<span class="status-pill OK">● Đầy đủ</span>`;
+                } else {
+                    statusPill = `<span class="status-pill ${d.status}">● ${d.status}</span>`;
+                }
+
+                const lastSeenStr = d.last_seen ? new Date(d.last_seen).toLocaleTimeString('vi-VN') : 'Chưa có';
+
+                deviceRows += `
+                    <tr style="border-bottom: 1px solid #f1f5f9; transition: background 0.15s ease;" onmouseover="this.style.background='#f8fafc'" onmouseout="this.style.background='white'">
+                        <td style="padding: 0.65rem 1rem 0.65rem 2.25rem;">
+                            <div style="display: flex; align-items: center; gap: 0.5rem;">
+                                <span style="color: #cbd5e1; font-weight: bold; user-select: none;">└─</span>
+                                <span class="badge" style="background: #e0f2fe; color: #0369a1; font-weight: 700; padding: 2px 7px;">#${d.cabin_order || 1}</span>
+                            </div>
+                        </td>
+                        <td style="padding: 0.65rem 1rem;">
+                            <strong style="color: var(--text-primary); font-size: 0.92rem;">${escapeHtml(d.label || '')}</strong>
+                        </td>
+                        <td style="padding: 0.65rem 1rem;">
+                            <code style="font-weight: 600; color: #334155; font-size: 0.85rem;">${d.mac_address}</code>
+                        </td>
+                        <td style="padding: 0.65rem 1rem;">
+                            <div style="display: flex; align-items: center; gap: 0.5rem;">
+                                <div style="flex: 1; min-width: 60px; max-width: 100px; height: 7px; background: #e2e8f0; border-radius: 4px; overflow: hidden;">
+                                    <div style="width: ${Math.min(100, Math.max(0, paperPct))}%; height: 100%; background: ${paperColor};"></div>
+                                </div>
+                                <strong style="font-size: 0.85rem; color: ${paperColor}; min-width: 36px;">${paperPct}%</strong>
+                            </div>
+                        </td>
+                        <td style="padding: 0.65rem 1rem;">
+                            <span style="font-size: 0.85rem; font-weight: 500;">🔋 ${Math.round(d.battery)}%</span>
+                        </td>
+                        <td style="padding: 0.65rem 1rem;">
+                            ${statusPill}
+                        </td>
+                        <td style="padding: 0.65rem 1rem; color: var(--text-secondary); font-size: 0.8rem;">
+                            ${lastSeenStr}
+                        </td>
+                        <td style="padding: 0.65rem 1.25rem; text-align: right; white-space: nowrap;">
+                            <button class="btn btn-secondary btn-sm" onclick="viewDeviceChart(${d.id}, '${escapeHtml(d.label || '')}')" title="Xem biểu đồ lịch sử" style="margin-right: 0.25rem;">📊 Lịch sử</button>
+                            <button class="btn btn-secondary btn-sm" onclick="openEditDeviceModal(${d.id}, '${d.mac_address}', '${escapeHtml(d.label || '')}', ${d.gateway_id}, ${d.cabin_order || 1})" title="Sửa thông tin" style="margin-right: 0.25rem;">✏️ Sửa</button>
+                            <button class="btn btn-danger btn-sm" onclick="handleDeleteDevice(${d.id})" title="Xóa thiết bị này">🗑️ Xóa</button>
+                        </td>
+                    </tr>
+                `;
+            });
+
+            devicesHtml = `
+                <div class="table-responsive" style="margin: 0;">
+                    <table style="width: 100%; border-collapse: collapse; margin: 0;">
+                        <thead>
+                            <tr style="background: #ffffff; color: var(--text-secondary); font-size: 0.73rem; text-transform: uppercase; letter-spacing: 0.05em; border-bottom: 1px solid #e2e8f0;">
+                                <th style="padding: 0.55rem 1rem 0.55rem 2.25rem; text-align: left; width: 100px;">Thứ tự</th>
+                                <th style="padding: 0.55rem 1rem; text-align: left;">Nhãn Cabin</th>
+                                <th style="padding: 0.55rem 1rem; text-align: left;">Địa chỉ MAC</th>
+                                <th style="padding: 0.55rem 1rem; text-align: left; width: 160px;">Mức giấy</th>
+                                <th style="padding: 0.55rem 1rem; text-align: left; width: 90px;">Pin</th>
+                                <th style="padding: 0.55rem 1rem; text-align: left; width: 120px;">Trạng thái</th>
+                                <th style="padding: 0.55rem 1rem; text-align: left; width: 110px;">Lần cuối</th>
+                                <th style="padding: 0.55rem 1.25rem; text-align: right; width: 220px;">Thao tác</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${deviceRows}
+                        </tbody>
+                    </table>
+                </div>
+            `;
+        }
+
+        const placeBtn = gw.is_new
+            ? `<button class="btn btn-primary btn-sm" onclick="event.stopPropagation(); assignGatewayToMap('${gw.mac_address || ''}', '${gw.ip_address || ''}')" title="Đặt vị trí trên bản đồ">📍 Đặt lên Map</button>`
+            : '';
+
+        card.innerHTML = `
+            <!-- PARENT HEADER: GATEWAY -->
+            <div class="gateway-parent-header" style="background: #f8fafc; padding: 0.85rem 1.25rem; border-bottom: ${isCollapsed ? 'none' : '1px solid var(--border-color)'}; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.75rem; border-left: 4px solid #2563eb;">
+                <div style="display: flex; align-items: center; gap: 0.65rem; cursor: pointer; flex-wrap: wrap;" onclick="toggleGatewayCollapse(${gw.id})" title="Nhấn để thu gọn hoặc mở rộng danh sách thiết bị con">
+                    <span style="font-size: 0.85rem; color: var(--text-secondary); width: 14px; text-align: center;">${isCollapsed ? '▶' : '▼'}</span>
+                    <span style="font-size: 1.3rem;">📡</span>
+                    <div>
+                        <div style="display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap;">
+                            <code style="font-size: 1rem; font-weight: 700; color: #1e40af;">MAC: ${gw.mac_address || 'Chưa có'}</code>
+                            <span style="font-size: 0.82rem; color: #475569;">(IP: <strong>${gw.ip_address || '---'}</strong>)</span>
+                            ${statusBadge}
+                            ${discBadge}
+                        </div>
+                        <div style="display: flex; align-items: center; gap: 0.6rem; font-size: 0.78rem; color: var(--text-secondary); margin-top: 3px; flex-wrap: wrap;">
+                            <span>🏢 Nhà ga: <strong>${escapeHtml(gw.terminal_name || '—')}</strong></span>
+                            <span>•</span>
+                            <span>📍 Tầng: <strong>${escapeHtml(gw.floor_name || '—')}</strong></span>
+                            <span>•</span>
+                            <span id="gw-wc-info-${gw.id}">🚻 WC: <strong style="color: #0369a1;">${escapeHtml(gw.toilet_name || 'Chưa gán')}</strong>${wcStatusBadge}</span>
+                            <span>•</span>
+                            <span id="gw-last-seen-${gw.id}">⏱️ Lần cuối: ${gw.last_seen ? new Date(gw.last_seen).toLocaleTimeString('vi-VN') : 'Chưa có'}</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div style="display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap;">
+                    <span class="badge ${devs.length > 0 ? 'badge-info' : 'badge-secondary'}" style="font-size: 0.8rem; padding: 0.35rem 0.65rem; margin-right: 0.25rem;">
+                        🔢 ${devs.length} thiết bị
+                    </span>
+                    ${placeBtn}
+                    <button class="btn btn-secondary btn-sm" id="btn-ping-gw-${gw.id}" onclick="event.stopPropagation(); checkAdminGateway('${gw.ip_address || ''}', ${gw.id}, ${gw.is_new ? 'true' : 'false'}, this)" title="Kiểm tra tín hiệu Gateway">
+                        🔍 Kiểm tra
+                    </button>
+                    <button class="btn btn-primary btn-sm" onclick="event.stopPropagation(); openAddCabinForGateway(${gw.id}, ${gw.toilet_id})" title="Thêm thiết bị con">
+                        ➕ Thêm Cabin
+                    </button>
+                    <button class="btn btn-danger btn-sm" onclick="event.stopPropagation(); handleDeleteGateway(${gw.id})" title="Xoá Gateway này">
+                        🗑️ Xoá
+                    </button>
+                </div>
+            </div>
+
+            <!-- CHILDREN: DISCOVERED & DEVICES -->
+            <div id="gw-children-container-${gw.id}" class="gateway-children-body" style="display: ${isCollapsed ? 'none' : 'block'}; background: white;">
+                ${discBannerHtml}
+                ${devicesHtml}
+            </div>
+        `;
+
+        container.appendChild(card);
+    });
+
+    // Check for any orphaned devices
+    const allGwIds = new Set(currentAdminGateways.map(g => g.id));
+    const orphanedDevs = currentAdminDevices ? currentAdminDevices.filter(d => !d.gateway_id || !allGwIds.has(d.gateway_id)) : [];
+    if (orphanedDevs.length > 0) {
+        const orphanCard = document.createElement('div');
+        orphanCard.style.cssText = 'background: white; border-radius: 8px; border: 1px solid #fecaca; margin-bottom: 1.25rem; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.05);';
+        orphanCard.innerHTML = `
+            <div style="background: #fff1f2; padding: 0.85rem 1.25rem; border-bottom: 1px solid #fecaca; display: flex; justify-content: space-between; align-items: center; border-left: 4px solid #ef4444;">
+                <div style="display: flex; align-items: center; gap: 0.5rem;">
+                    <span style="font-size: 1.25rem;">⚠️</span>
+                    <strong style="color: #991b1b; font-size: 1rem;">Thiết Bị Chưa Gán Gateway (${orphanedDevs.length} thiết bị)</strong>
+                </div>
+            </div>
+            <div class="table-responsive" style="margin: 0;">
+                <table style="width: 100%; border-collapse: collapse; margin: 0;">
+                    <thead>
+                        <tr style="background: #ffffff; color: var(--text-secondary); font-size: 0.73rem; text-transform: uppercase; border-bottom: 1px solid #e2e8f0;">
+                            <th style="padding: 0.55rem 1rem 0.55rem 1.5rem; text-align: left;">ID</th>
+                            <th style="padding: 0.55rem 1rem; text-align: left;">Nhãn Cabin</th>
+                            <th style="padding: 0.55rem 1rem; text-align: left;">Địa chỉ MAC</th>
+                            <th style="padding: 0.55rem 1rem; text-align: left;">Trạng thái</th>
+                            <th style="padding: 0.55rem 1.25rem; text-align: right;">Thao tác</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${orphanedDevs.map(d => `
+                            <tr style="border-bottom: 1px solid #f1f5f9;">
+                                <td style="padding: 0.65rem 1rem 0.65rem 1.5rem;">#${d.id}</td>
+                                <td style="padding: 0.65rem 1rem;"><strong>${escapeHtml(d.label || '')}</strong></td>
+                                <td style="padding: 0.65rem 1rem;"><code>${d.mac_address}</code></td>
+                                <td style="padding: 0.65rem 1rem;"><span class="status-pill ${d.status}">● ${d.status}</span></td>
+                                <td style="padding: 0.65rem 1.25rem; text-align: right;">
+                                    <button class="btn btn-secondary btn-sm" onclick="openEditDeviceModal(${d.id}, '${d.mac_address}', '${escapeHtml(d.label || '')}', ${d.gateway_id || 0}, ${d.cabin_order || 1})">Gán Gateway</button>
+                                    <button class="btn btn-danger btn-sm" onclick="handleDeleteDevice(${d.id})">Xoá</button>
+                                </td>
+                            </tr>
+                        `).join('')}
+                    </tbody>
+                </table>
+            </div>
+        `;
+        container.appendChild(orphanCard);
+    }
+
+    // Discovered clients not yet associated with any registered Gateway
+    const allDiscovered = currentDiscoveredMap["_all"] || [];
+    const unassociatedDisc = allDiscovered.filter(c => {
+        const cMac = (c.mac_address || '').toUpperCase();
+        const claimed = currentAdminGateways.some(gw => 
+            (c.gateway_id && c.gateway_id === gw.id) ||
+            (c.gateway_mac && gw.mac_address && c.gateway_mac.toUpperCase() === gw.mac_address.toUpperCase()) ||
+            (c.gateway_ip && gw.ip_address && c.gateway_ip === gw.ip_address)
+        );
+        return !claimed;
+    });
+
+    if (unassociatedDisc.length > 0) {
+        const unassocCard = document.createElement('div');
+        unassocCard.style.cssText = 'background: white; border-radius: 8px; border: 1px solid #fed7aa; margin-bottom: 1.25rem; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.05);';
+        unassocCard.innerHTML = `
+            <div style="background: #fff7ed; padding: 0.85rem 1.25rem; border-bottom: 1px solid #fed7aa; display: flex; justify-content: space-between; align-items: center; border-left: 4px solid #f97316;">
+                <div style="display: flex; align-items: center; gap: 0.5rem;">
+                    <span style="font-size: 1.25rem;">📡</span>
+                    <strong style="color: #9a3412; font-size: 1rem;">Client ESP Mới Phát Hiện (Chưa gán Gateway) (${unassociatedDisc.length} client)</strong>
+                </div>
+            </div>
+            <div style="padding: 0.75rem 1.25rem; display: flex; flex-direction: column; gap: 0.4rem;">
+                ${unassociatedDisc.map(c => `
+                    <div style="background: white; border: 1px solid #fed7aa; border-radius: 6px; padding: 0.45rem 0.75rem; display: flex; justify-content: space-between; align-items: center; font-size: 0.85rem;">
+                        <div>
+                            • MAC: <code style="font-weight: 700; color: #ea580c;">${c.mac_address}</code> | Giấy: <strong>${Math.round(c.paper_level)}%</strong> | Pin: <strong>${Math.round(c.battery)}%</strong> | Từ IP: <strong>${c.gateway_ip || '---'}</strong>
+                        </div>
+                        <div style="display: flex; gap: 0.35rem;">
+                            <button class="btn btn-primary btn-sm" onclick="openAddCabinForGateway(null, null, '${c.mac_address}')" style="padding: 2px 8px; font-size: 0.75rem;">➕ Lưu Client</button>
+                            <button class="btn btn-danger btn-sm" onclick="handleDeleteDiscoveredClient('${c.mac_address}')" style="padding: 2px 8px; font-size: 0.75rem;" title="Xóa bỏ client mới phát hiện này">🗑️ Xóa</button>
+                        </div>
+                    </div>
+                `).join('')}
+            </div>
+        `;
+        container.appendChild(unassocCard);
+    }
+}
+
+function toggleGatewayCollapse(gwId) {
+    if (collapsedGateways.has(gwId)) {
+        collapsedGateways.delete(gwId);
+    } else {
+        collapsedGateways.add(gwId);
+    }
+    renderAdminGatewaysTree();
+}
+
+function toggleAllGatewaysCollapse() {
+    const btn = document.getElementById('btn-toggle-all-gateways');
+    if (collapsedGateways.size === currentAdminGateways.length) {
+        collapsedGateways.clear();
+        if (btn) btn.innerText = "Thu gọn tất cả";
+    } else {
+        collapsedGateways = new Set(currentAdminGateways.map(g => g.id));
+        if (btn) btn.innerText = "Mở rộng tất cả";
+    }
+    renderAdminGatewaysTree();
+}
+
+async function openAddCabinForGateway(gatewayId, toiletId, defaultMac = '') {
+    if (!toiletId) {
+        const gw = currentAdminGateways.find(g => g.id === gatewayId);
+        if (confirm(`Gateway [${gw ? (gw.mac_address || gw.ip_address) : gatewayId}] chưa được gán vào Nhà vệ sinh nào trên bản đồ.
+
+Bạn có muốn chuyển sang Bản đồ để Đặt vị trí cho Gateway này ngay bây giờ không?`)) {
+            assignGatewayToMap(gw ? gw.mac_address : '', gw ? gw.ip_address : '');
+        }
+        return;
+    }
+    await fetchAllToilets();
+    document.getElementById('add-cabin-modal-title').innerText = "Thêm Thiết Bị / Cabin Cho Gateway";
+    document.getElementById('group-add-cabin-toilet-select').style.display = 'block';
+    document.getElementById('group-add-cabin-toilet-name').style.display = 'none';
+
+    const sel = document.getElementById('add-cabin-select-toilet');
+    sel.innerHTML = '';
+    allToiletsCache.forEach(t => {
+        const opt = document.createElement('option');
+        opt.value = t.id;
+        opt.innerText = `${t.terminal_name} - ${t.floor_name} - ${t.name}`;
+        if (t.id === toiletId) opt.selected = true;
+        sel.appendChild(opt);
+    });
+
+    onAddCabinToiletSelectChange();
+    if (defaultMac) {
+        document.getElementById('add-cabin-mac').value = defaultMac;
+    }
+    document.getElementById('modal-add-cabin').style.display = 'flex';
 }
 
 async function checkAdminGateway(ip, gwId, isNew, btn) {
-    if (!ip) return;
+    if (!ip) {
+        showToast("Gateway chưa có địa chỉ IP để kiểm tra", "LOW");
+        return;
+    }
     const originalText = btn ? btn.innerText : '🔍 Kiểm tra';
     if (btn) {
         btn.innerText = '⏳ Đang kiểm tra...';
@@ -2290,23 +3481,23 @@ async function checkAdminGateway(ip, gwId, isNew, btn) {
             showToast(`🟢 Gateway ${ip} đang ONLINE!`, 'OK');
             if (badgeEl) {
                 if (isNew) {
-                    badgeEl.innerHTML = `<span style="background: #f8fafc; color: #475569; border: 1px solid #cbd5e1; padding: 2px 8px; border-radius: 9999px; font-size: 0.75rem; font-weight: 600;">⚪ Có tín hiệu (Chưa gán)</span>`;
+                    badgeEl.innerHTML = `<span style="background: #f8fafc; color: #475569; border: 1px solid #cbd5e1; padding: 3px 8px; border-radius: 9999px; font-size: 0.75rem; font-weight: 600;">⚪ Có tín hiệu (Chưa gán)</span>`;
                 } else {
-                    badgeEl.innerHTML = `<span style="background: #dcfce7; color: #15803d; border: 1px solid #86efac; padding: 2px 8px; border-radius: 9999px; font-size: 0.75rem; font-weight: 600;">🟢 Online</span>`;
+                    badgeEl.innerHTML = `<span style="background: #dcfce7; color: #15803d; border: 1px solid #86efac; padding: 3px 8px; border-radius: 9999px; font-size: 0.75rem; font-weight: 600;">🟢 Online</span>`;
                 }
             }
         } else {
             showToast(`🔴 Gateway ${ip} MẤT KẾT NỐI! ${data.message || ''}`, 'EMPTY');
             if (badgeEl) {
                 if (isNew) {
-                    badgeEl.innerHTML = `<span style="background: #f8fafc; color: #94a3b8; border: 1px solid #e2e8f0; padding: 2px 8px; border-radius: 9999px; font-size: 0.75rem; font-weight: 600;">⚪ Mất kết nối (Chưa gán)</span>`;
+                    badgeEl.innerHTML = `<span style="background: #f8fafc; color: #94a3b8; border: 1px solid #e2e8f0; padding: 3px 8px; border-radius: 9999px; font-size: 0.75rem; font-weight: 600;">⚪ Mất kết nối (Chưa gán)</span>`;
                 } else {
-                    badgeEl.innerHTML = `<span style="background: #fee2e2; color: #b91c1c; border: 1px solid #fecaca; padding: 2px 8px; border-radius: 9999px; font-size: 0.75rem; font-weight: 600;">🔴 Mất kết nối</span>`;
+                    badgeEl.innerHTML = `<span style="background: #fee2e2; color: #b91c1c; border: 1px solid #fecaca; padding: 3px 8px; border-radius: 9999px; font-size: 0.75rem; font-weight: 600;">🔴 Mất kết nối</span>`;
                 }
             }
         }
         if (lastSeenEl && data.last_seen) {
-            lastSeenEl.innerText = new Date(data.last_seen).toLocaleTimeString('vi-VN');
+            lastSeenEl.innerText = '⏱️ Lần cuối: ' + new Date(data.last_seen).toLocaleTimeString('vi-VN');
         }
     } catch (err) {
         showToast(`Lỗi kiểm tra Gateway: ${err.message}`, 'EMPTY');
@@ -2341,21 +3532,35 @@ async function checkAllAdminGateways() {
 }
 
 async function handleCreateGateway() {
+    const macInput = document.getElementById('new-gw-mac');
     const ipInput = document.getElementById('new-gw-ip');
-    const ip = ipInput.value.trim();
-    if (!ip) return;
+    const mac = macInput ? macInput.value.trim() : '';
+    const ip = ipInput ? ipInput.value.trim() : '';
+    if (!mac && !ip) {
+        alert("Vui lòng nhập Địa chỉ MAC cứng hoặc IP của Gateway");
+        return;
+    }
 
     try {
-        const res = await apiFetch(`/api/admin/gateways?ip_address=${encodeURIComponent(ip)}`, { method: 'POST' });
+        const res = await apiFetch('/api/admin/gateways', {
+            method: 'POST',
+            body: JSON.stringify({
+                mac_address: mac || null,
+                ip_address: ip || null
+            })
+        });
         if (res.ok) {
-            showToast("Đã thêm Gateway mới!", "OK");
-            ipInput.value = '';
+            showToast("Đã thêm Gateway mới thành công!", "OK");
+            if (macInput) macInput.value = '';
+            if (ipInput) ipInput.value = '';
             loadAdminGateways();
         } else {
             const err = await res.json();
             alert(err.detail || "Không thể thêm Gateway");
         }
-    } catch (err) {}
+    } catch (err) {
+        alert("Lỗi khi thêm Gateway: " + err.message);
+    }
 }
 
 async function handleDeleteGateway(id) {
@@ -2365,60 +3570,34 @@ async function handleDeleteGateway(id) {
         if (res.ok) {
             showToast("Đã xoá Gateway", "OK");
             loadAdminGateways();
-            loadAdminDevices();
         }
     } catch (err) {}
 }
 
+let assignedGatewayMacForPlacement = null;
 let assignedGatewayIpForPlacement = null;
 
-function assignGatewayToMap(gatewayIp) {
-    assignedGatewayIpForPlacement = gatewayIp;
-    // Chuyển sang View Bản Đồ Tầng (view-dashboard)
+function assignGatewayToMap(gatewayMac, gatewayIp) {
+    assignedGatewayMacForPlacement = gatewayMac || null;
+    assignedGatewayIpForPlacement = gatewayIp || null;
     switchView('dashboard');
-    // Bật chế độ đặt vị trí trên bản đồ
     if (!isPlacementMode) {
         togglePlacementMode();
     }
-    showToast(`Đã chọn Gateway ${gatewayIp}. Hãy chọn Nhà ga/Tầng và click vào vị trí trên bản đồ!`, "OK");
+    const label = gatewayMac ? `MAC: ${gatewayMac}` : `IP: ${gatewayIp}`;
+    showToast(`Đã chọn Gateway [${label}]. Hãy chọn Nhà ga/Tầng và click vào vị trí trên bản đồ!`, "OK");
 }
 
-async function loadAdminDevices() {
-    try {
-        const res = await apiFetch('/api/admin/devices');
-        if (!res.ok) return;
-        const devices = await res.json();
-
-        const tbody = document.getElementById('admin-devices-table');
-        tbody.innerHTML = '';
-        devices.forEach(d => {
-            const tr = document.createElement('tr');
-            tr.innerHTML = `
-                <td>${d.id}</td>
-                <td><strong style="color: var(--primary);">#${d.cabin_order || 1}</strong></td>
-                <td><code>${d.mac_address}</code></td>
-                <td><strong>${d.label}</strong></td>
-                <td>${d.gateway_ip}</td>
-                <td>${d.toilet_name}</td>
-                <td>${Math.round(d.paper_level)}%</td>
-                <td>${Math.round(d.battery)}%</td>
-                <td><span class="status-pill ${d.status}">● ${d.status}</span></td>
-                <td>
-                    <button class="btn btn-secondary btn-sm" onclick="openEditDeviceModal(${d.id}, '${d.mac_address}', '${d.label}', ${d.gateway_id}, ${d.cabin_order || 1})">Sửa</button>
-                    <button class="btn btn-danger btn-sm" onclick="handleDeleteDevice(${d.id})">Xoá</button>
-                </td>
-            `;
-            tbody.appendChild(tr);
-        });
-    } catch (err) {}
-}
-
-function openEditDeviceModal(id, mac, label, gatewayId, cabinOrder) {
+function openEditDeviceModal(id, mac, label, gatewayId, cabinOrder, paperProfileId) {
     document.getElementById('form-device-id').value = id;
     document.getElementById('form-device-mac').value = mac;
     document.getElementById('form-device-order').value = cabinOrder || 1;
     document.getElementById('form-device-label').value = label;
     document.getElementById('form-device-gw').value = gatewayId;
+    const profSelect = document.getElementById('form-device-paper-profile');
+    if (profSelect) {
+        profSelect.value = paperProfileId || '';
+    }
     document.getElementById('modal-device-form').style.display = 'flex';
 }
 
@@ -2434,9 +3613,10 @@ async function handleDeviceFormSubmit(e) {
     const gatewayId = parseInt(document.getElementById('form-device-gw').value);
 
     try {
+        const paperProfileId = parseInt(document.getElementById('form-device-paper-profile')?.value) || null;
         const res = await apiFetch(`/api/admin/devices/${id}`, {
             method: 'PUT',
-            body: JSON.stringify({ label, gateway_id: gatewayId, cabin_order: cabinOrder })
+            body: JSON.stringify({ label, gateway_id: gatewayId, cabin_order: cabinOrder, paper_profile_id: paperProfileId })
         });
         if (res.ok) {
             showToast("Đã cập nhật thông tin thiết bị!", "OK");
@@ -2552,7 +3732,8 @@ async function handleAddCabinSubmit(e) {
                 mac_address: mac,
                 toilet_id: toiletId,
                 cabin_order: cabinOrder,
-                label: label
+                label: label,
+                paper_profile_id: parseInt(document.getElementById('add-cabin-paper-profile')?.value) || null
             })
         });
 
@@ -2606,4 +3787,481 @@ function showToast(message, type = 'OK') {
         toast.style.opacity = '0';
         setTimeout(() => toast.remove(), 400);
     }, 4500);
+}
+
+// ================= TERMINAL & FLOOR MANAGEMENT (PARENT-CHILD HIERARCHY) =================
+let currentAdminTerminals = [];
+let collapsedTerminals = new Set();
+
+async function loadAdminTerminals() {
+    const container = document.getElementById('admin-terminals-tree-container');
+    if (!container) return;
+
+    try {
+        const res = await apiFetch('/api/admin/terminals');
+        if (!res.ok) {
+            container.innerHTML = '<div class="alert alert-danger" style="margin: 1rem 0;">Không thể tải danh sách nhà ga</div>';
+            return;
+        }
+        currentAdminTerminals = await res.json();
+        renderAdminTerminalsTree();
+    } catch (err) {
+        console.error("Error loading admin terminals:", err);
+        if (container) {
+            container.innerHTML = `<div class="alert alert-danger" style="margin: 1rem 0;">Lỗi kết nối máy chủ: ${escapeHtml(err.message)}</div>`;
+        }
+    }
+}
+
+function renderAdminTerminalsTree() {
+    const container = document.getElementById('admin-terminals-tree-container');
+    if (!container) return;
+    container.innerHTML = '';
+
+    if (!currentAdminTerminals || currentAdminTerminals.length === 0) {
+        container.innerHTML = `
+            <div style="background: white; border-radius: 8px; border: 1px dashed var(--border-color); padding: 3rem 1.5rem; text-align: center; color: var(--text-secondary);">
+                <div style="font-size: 2.5rem; margin-bottom: 0.5rem;">🏢</div>
+                <h4 style="color: var(--text-primary); margin-bottom: 0.5rem; font-size: 1.1rem;">Chưa có Nhà ga nào trong hệ thống</h4>
+                <p style="font-size: 0.9rem; margin-bottom: 1.25rem;">Hãy tạo Nhà ga đầu tiên để bắt đầu thiết lập các tầng và sơ đồ bản đồ.</p>
+                <button class="btn btn-primary" onclick="openCreateTerminalModal()">➕ Thêm Nhà ga mới ngay</button>
+            </div>
+        `;
+        return;
+    }
+
+    currentAdminTerminals.forEach(term => {
+        const isCollapsed = collapsedTerminals.has(term.id);
+        const card = document.createElement('div');
+        card.className = 'terminal-group-card';
+        card.style.cssText = 'background: white; border-radius: 8px; border: 1px solid var(--border-color); margin-bottom: 1.25rem; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.05);';
+
+        const floors = term.floors || [];
+
+        // Floors rows HTML
+        let floorsHtml = '';
+        if (floors.length === 0) {
+            floorsHtml = `
+                <div style="padding: 1.5rem 2.5rem; text-align: center; color: var(--text-secondary); background: #fafbfc; border-top: 1px solid #f1f5f9;">
+                    <p style="margin: 0 0 0.5rem 0; font-size: 0.9rem;">Nhà ga này chưa có tầng nào.</p>
+                    <button class="btn btn-secondary btn-sm" onclick="openCreateFloorModal(${term.id})">➕ Thêm tầng con đầu tiên cho ${escapeHtml(term.name)}</button>
+                </div>
+            `;
+        } else {
+            let floorRows = '';
+            floors.forEach(fl => {
+                const hasMap = !!fl.map_pdf_path;
+                const mapBadge = hasMap
+                    ? `<span class="badge badge-success" style="cursor: pointer; padding: 0.35rem 0.6rem;" onclick="window.open('${fl.map_pdf_path}', '_blank')" title="Bấm để xem PDF">✅ Đã có sơ đồ PDF</span>`
+                    : `<span class="badge badge-warning" style="padding: 0.35rem 0.6rem;">⚠️ Chưa có bản đồ</span>`;
+
+                const mapBtn = hasMap
+                    ? `<button class="btn btn-secondary btn-sm" onclick="openFloorMapDirectModal(${fl.id}, '${escapeHtml(fl.name)}', '${escapeHtml(term.name)}')" title="Đổi file PDF sơ đồ bản đồ" style="margin-right: 0.25rem;">🗺️ Đổi bản đồ</button>`
+                    : `<button class="btn btn-primary btn-sm" onclick="openFloorMapDirectModal(${fl.id}, '${escapeHtml(fl.name)}', '${escapeHtml(term.name)}')" title="Tải lên sơ đồ bản đồ PDF" style="margin-right: 0.25rem;">🗺️ Tải lên bản đồ</button>`;
+
+                floorRows += `
+                    <tr style="border-bottom: 1px solid #f1f5f9; transition: background 0.15s ease;" onmouseover="this.style.background='#f8fafc'" onmouseout="this.style.background='white'">
+                        <td style="padding: 0.75rem 1.25rem 0.75rem 2.5rem;">
+                            <div style="display: flex; align-items: center; gap: 0.6rem;">
+                                <span style="color: #cbd5e1; font-weight: bold; user-select: none;">└─</span>
+                                <span style="font-size: 1.1rem;">🗺️</span>
+                                <div>
+                                    <strong style="color: var(--text-primary); font-size: 0.95rem;">${escapeHtml(fl.name)}</strong>
+                                    <span style="color: var(--text-secondary); font-size: 0.75rem; margin-left: 0.4rem;">(ID: #${fl.id})</span>
+                                </div>
+                            </div>
+                        </td>
+                        <td style="padding: 0.75rem 1rem;">
+                            <div style="display: flex; align-items: center; gap: 0.5rem;">
+                                ${mapBadge}
+                                ${hasMap ? `<a href="${fl.map_pdf_path}" target="_blank" style="font-size: 0.8rem; color: var(--primary-color); text-decoration: none; font-weight: 500;" title="Xem file gốc">👁️ Xem</a>` : ''}
+                            </div>
+                        </td>
+                        <td style="padding: 0.75rem 1rem; text-align: center;">
+                            <span class="badge ${fl.toilet_count > 0 ? 'badge-success' : 'badge-secondary'}" style="font-size: 0.8rem; padding: 0.3rem 0.6rem;">${fl.toilet_count} toilet</span>
+                        </td>
+                        <td style="padding: 0.75rem 1.25rem; text-align: right; white-space: nowrap;">
+                            ${mapBtn}
+                            <button class="btn btn-secondary btn-sm" onclick="openEditFloorModal(${fl.id}, ${term.id}, '${escapeHtml(fl.name)}')" title="Đổi tên tầng" style="margin-right: 0.25rem;">✏️ Sửa</button>
+                            <button class="btn btn-danger btn-sm" onclick="handleDeleteFloor(${fl.id}, '${escapeHtml(fl.name)}', ${fl.toilet_count})" title="Xóa tầng">🗑️ Xóa</button>
+                        </td>
+                    </tr>
+                `;
+            });
+
+            floorsHtml = `
+                <div class="table-responsive" style="margin: 0;">
+                    <table style="width: 100%; border-collapse: collapse; margin: 0;">
+                        <thead>
+                            <tr style="background: #ffffff; color: var(--text-secondary); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; border-bottom: 1px solid #e2e8f0;">
+                                <th style="padding: 0.6rem 1.25rem 0.6rem 2.5rem; text-align: left;">Tầng con</th>
+                                <th style="padding: 0.6rem 1rem; text-align: left;">Sơ đồ Bản đồ PDF</th>
+                                <th style="padding: 0.6rem 1rem; text-align: center; width: 140px;">Số Toilet</th>
+                                <th style="padding: 0.6rem 1.25rem; text-align: right; width: 260px;">Thao tác Tầng</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${floorRows}
+                        </tbody>
+                    </table>
+                </div>
+            `;
+        }
+
+        card.innerHTML = `
+            <!-- PARENT HEADER: TERMINAL -->
+            <div class="terminal-parent-header" style="background: #f8fafc; padding: 0.85rem 1.25rem; border-bottom: ${isCollapsed ? 'none' : '1px solid var(--border-color)'}; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.75rem; border-left: 4px solid var(--primary-color);">
+                <div style="display: flex; align-items: center; gap: 0.6rem; cursor: pointer;" onclick="toggleTerminalCollapse(${term.id})" title="Nhấn để thu gọn hoặc mở rộng tầng con">
+                    <span style="font-size: 0.85rem; color: var(--text-secondary); width: 14px; text-align: center;">${isCollapsed ? '▶' : '▼'}</span>
+                    <span style="font-size: 1.3rem;">🏢</span>
+                    <strong style="font-size: 1.15rem; color: var(--text-primary); letter-spacing: 0.01em;">Nhà ga ${escapeHtml(term.name)}</strong>
+                    <span style="color: var(--text-secondary); font-size: 0.8rem; margin-right: 0.35rem;">(#${term.id})</span>
+                    <span class="badge badge-info" style="font-size: 0.8rem; font-weight: 600; padding: 0.3rem 0.6rem;">${term.floor_count} tầng</span>
+                    <span class="badge ${term.toilet_count > 0 ? 'badge-success' : 'badge-secondary'}" style="font-size: 0.8rem; padding: 0.3rem 0.6rem;">${term.toilet_count} toilet</span>
+                </div>
+                <div style="display: flex; align-items: center; gap: 0.4rem;">
+                    <button class="btn btn-primary btn-sm" onclick="openCreateFloorModal(${term.id})" title="Thêm tầng con vào ${escapeHtml(term.name)}">➕ Thêm tầng con</button>
+                    <button class="btn btn-secondary btn-sm" onclick="openEditTerminalModal(${term.id}, '${escapeHtml(term.name)}')" title="Đổi tên nhà ga">✏️ Sửa tên</button>
+                    <button class="btn btn-danger btn-sm" onclick="handleDeleteTerminal(${term.id}, '${escapeHtml(term.name)}', ${term.floor_count})" title="Xóa nhà ga">🗑️ Xóa</button>
+                </div>
+            </div>
+
+            <!-- CHILDREN: FLOORS -->
+            <div id="term-floors-container-${term.id}" class="terminal-children-body" style="display: ${isCollapsed ? 'none' : 'block'}; background: white;">
+                ${floorsHtml}
+            </div>
+        `;
+
+        container.appendChild(card);
+    });
+}
+
+function toggleTerminalCollapse(termId) {
+    if (collapsedTerminals.has(termId)) {
+        collapsedTerminals.delete(termId);
+    } else {
+        collapsedTerminals.add(termId);
+    }
+    renderAdminTerminalsTree();
+}
+
+function toggleAllTerminalsCollapse() {
+    const btn = document.getElementById('btn-toggle-all-terminals');
+    if (collapsedTerminals.size === currentAdminTerminals.length) {
+        collapsedTerminals.clear();
+        if (btn) btn.innerText = "Thu gọn tất cả";
+    } else {
+        currentAdminTerminals.forEach(t => collapsedTerminals.add(t.id));
+        if (btn) btn.innerText = "Mở rộng tất cả";
+    }
+    renderAdminTerminalsTree();
+}
+
+// Terminal Modal Functions
+function openCreateTerminalModal() {
+    document.getElementById('terminal-modal-title').innerText = "Thêm Nhà Ga Mới";
+    document.getElementById('form-terminal-id').value = "";
+    document.getElementById('form-terminal-name').value = "";
+    document.getElementById('terminal-form-error').style.display = "none";
+    document.getElementById('btn-submit-terminal').innerText = "Tạo Nhà Ga";
+    document.getElementById('modal-terminal-form').style.display = "flex";
+}
+
+function openEditTerminalModal(id, name) {
+    document.getElementById('terminal-modal-title').innerText = "Chỉnh Sửa Tên Nhà Ga";
+    document.getElementById('form-terminal-id').value = id;
+    document.getElementById('form-terminal-name').value = name;
+    document.getElementById('terminal-form-error').style.display = "none";
+    document.getElementById('btn-submit-terminal').innerText = "Lưu Thay Đổi";
+    document.getElementById('modal-terminal-form').style.display = "flex";
+}
+
+function closeTerminalModal() {
+    document.getElementById('modal-terminal-form').style.display = "none";
+}
+
+async function handleTerminalFormSubmit(e) {
+    e.preventDefault();
+    const id = document.getElementById('form-terminal-id').value;
+    const name = document.getElementById('form-terminal-name').value.trim();
+    const errBox = document.getElementById('terminal-form-error');
+    errBox.style.display = "none";
+
+    if (!name) {
+        errBox.innerText = "Vui lòng nhập tên nhà ga";
+        errBox.style.display = "block";
+        return;
+    }
+
+    try {
+        let res;
+        if (id) {
+            res = await apiFetch(`/api/admin/terminals/${id}`, {
+                method: 'PUT',
+                body: JSON.stringify({ name })
+            });
+        } else {
+            res = await apiFetch('/api/admin/terminals', {
+                method: 'POST',
+                body: JSON.stringify({ name })
+            });
+        }
+
+        if (res.ok) {
+            const data = await res.json();
+            showToast(data.message || "Lưu nhà ga thành công", "OK");
+            closeTerminalModal();
+            await loadAdminTerminals();
+            await loadTerminals();
+            loadAdminMapsOptions();
+        } else {
+            const err = await res.json();
+            errBox.innerText = err.detail || "Không thể lưu nhà ga";
+            errBox.style.display = "block";
+        }
+    } catch (err) {
+        errBox.innerText = "Lỗi kết nối máy chủ: " + err.message;
+        errBox.style.display = "block";
+    }
+}
+
+async function handleDeleteTerminal(id, name, floorCount) {
+    const confirmMsg = floorCount > 0
+        ? `CẢNH BÁO: Nhà ga "${name}" đang có ${floorCount} tầng và các nhà vệ sinh liên quan.\n\nBạn có CHẮC CHẮN muốn xóa nhà ga này và TOÀN BỘ dữ liệu bên trong không?`
+        : `Bạn có chắc chắn muốn xóa Nhà ga "${name}" không?`;
+
+    if (!confirm(confirmMsg)) return;
+
+    try {
+        const res = await apiFetch(`/api/admin/terminals/${id}`, { method: 'DELETE' });
+        if (res.ok) {
+            const data = await res.json();
+            showToast(data.message || "Đã xóa nhà ga", "OK");
+            await loadAdminTerminals();
+            await loadTerminals();
+            loadAdminMapsOptions();
+        } else {
+            const err = await res.json();
+            alert(err.detail || "Không thể xóa nhà ga");
+        }
+    } catch (err) {
+        alert("Lỗi kết nối máy chủ: " + err.message);
+    }
+}
+
+// Floor Modal Functions
+function openCreateFloorModal(defaultTerminalId = null) {
+    document.getElementById('floor-modal-title').innerText = "Thêm Tầng Mới Cho Nhà Ga";
+    document.getElementById('form-floor-id').value = "";
+    document.getElementById('form-floor-name').value = "";
+    document.getElementById('form-floor-map-file').value = "";
+    document.getElementById('group-floor-map-upload').style.display = "block";
+    document.getElementById('floor-form-error').style.display = "none";
+    document.getElementById('btn-submit-floor').innerText = "Tạo Tầng";
+
+    // Populate terminal options
+    const termSel = document.getElementById('form-floor-terminal');
+    termSel.innerHTML = "";
+    currentAdminTerminals.forEach(term => {
+        const opt = document.createElement('option');
+        opt.value = term.id;
+        opt.innerText = term.name;
+        termSel.appendChild(opt);
+    });
+
+    if (defaultTerminalId) {
+        termSel.value = defaultTerminalId;
+    }
+
+    document.getElementById('modal-floor-form').style.display = "flex";
+}
+
+function openEditFloorModal(floorId, terminalId, floorName) {
+    document.getElementById('floor-modal-title').innerText = "Chỉnh Sửa Tầng";
+    document.getElementById('form-floor-id').value = floorId;
+    document.getElementById('form-floor-name').value = floorName;
+    document.getElementById('group-floor-map-upload').style.display = "none";
+    document.getElementById('floor-form-error').style.display = "none";
+    document.getElementById('btn-submit-floor').innerText = "Lưu Thay Đổi";
+
+    // Populate terminal options
+    const termSel = document.getElementById('form-floor-terminal');
+    termSel.innerHTML = "";
+    currentAdminTerminals.forEach(term => {
+        const opt = document.createElement('option');
+        opt.value = term.id;
+        opt.innerText = term.name;
+        termSel.appendChild(opt);
+    });
+    termSel.value = terminalId;
+
+    document.getElementById('modal-floor-form').style.display = "flex";
+}
+
+function closeFloorModal() {
+    document.getElementById('modal-floor-form').style.display = "none";
+}
+
+async function handleFloorFormSubmit(e) {
+    e.preventDefault();
+    const id = document.getElementById('form-floor-id').value;
+    const terminalId = parseInt(document.getElementById('form-floor-terminal').value);
+    const name = document.getElementById('form-floor-name').value.trim();
+    const mapFileInput = document.getElementById('form-floor-map-file');
+    const errBox = document.getElementById('floor-form-error');
+    errBox.style.display = "none";
+
+    if (!terminalId) {
+        errBox.innerText = "Vui lòng chọn nhà ga";
+        errBox.style.display = "block";
+        return;
+    }
+    if (!name) {
+        errBox.innerText = "Vui lòng nhập tên tầng";
+        errBox.style.display = "block";
+        return;
+    }
+
+    try {
+        let res;
+        if (id) {
+            res = await apiFetch(`/api/admin/floors/${id}`, {
+                method: 'PUT',
+                body: JSON.stringify({ terminal_id: terminalId, name })
+            });
+        } else {
+            res = await apiFetch('/api/admin/floors', {
+                method: 'POST',
+                body: JSON.stringify({ terminal_id: terminalId, name })
+            });
+        }
+
+        if (res.ok) {
+            const data = await res.json();
+            const newFloorId = data.id || id;
+
+            // If map file was selected during creation, upload it now
+            if (!id && mapFileInput && mapFileInput.files.length > 0 && newFloorId) {
+                const formData = new FormData();
+                formData.append('file', mapFileInput.files[0]);
+                try {
+                    await apiFetch(`/api/admin/floors/${newFloorId}/map`, {
+                        method: 'POST',
+                        body: formData
+                    });
+                } catch (mapErr) {
+                    console.warn("Lỗi upload sơ đồ bản đồ:", mapErr);
+                }
+            }
+
+            showToast(data.message || "Lưu tầng thành công", "OK");
+            closeFloorModal();
+            await loadAdminTerminals();
+            await loadTerminals();
+            loadAdminMapsOptions();
+        } else {
+            const err = await res.json();
+            errBox.innerText = err.detail || "Không thể lưu tầng";
+            errBox.style.display = "block";
+        }
+    } catch (err) {
+        errBox.innerText = "Lỗi kết nối máy chủ: " + err.message;
+        errBox.style.display = "block";
+    }
+}
+
+async function handleDeleteFloor(floorId, floorName, toiletCount) {
+    const confirmMsg = toiletCount > 0
+        ? `CẢNH BÁO: Tầng "${floorName}" đang có ${toiletCount} nhà vệ sinh.\n\nBạn có chắc chắn muốn xóa tầng này và toàn bộ nhà vệ sinh thuộc tầng không?`
+        : `Bạn có chắc chắn muốn xóa Tầng "${floorName}" không?`;
+
+    if (!confirm(confirmMsg)) return;
+
+    try {
+        const res = await apiFetch(`/api/admin/floors/${floorId}`, { method: 'DELETE' });
+        if (res.ok) {
+            const data = await res.json();
+            showToast(data.message || "Đã xóa tầng", "OK");
+            await loadAdminTerminals();
+            await loadTerminals();
+            loadAdminMapsOptions();
+        } else {
+            const err = await res.json();
+            alert(err.detail || "Không thể xóa tầng");
+        }
+    } catch (err) {
+        alert("Lỗi kết nối máy chủ: " + err.message);
+    }
+}
+
+// Floor Map Direct Upload Modal Functions
+function openFloorMapDirectModal(floorId, floorName, terminalName) {
+    document.getElementById('floor-map-direct-id').value = floorId;
+    document.getElementById('floor-map-direct-title').innerText = `Bản Đồ: ${floorName}`;
+    document.getElementById('floor-map-direct-desc').innerText = `Chọn file PDF sơ đồ kiến trúc cho: ${terminalName} - ${floorName}`;
+    document.getElementById('floor-map-direct-file').value = "";
+    document.getElementById('floor-map-direct-error').style.display = "none";
+    document.getElementById('modal-floor-map-direct').style.display = "flex";
+}
+
+function closeFloorMapDirectModal() {
+    document.getElementById('modal-floor-map-direct').style.display = "none";
+}
+
+async function handleFloorMapDirectSubmit(e) {
+    e.preventDefault();
+    const floorId = document.getElementById('floor-map-direct-id').value;
+    const fileInput = document.getElementById('floor-map-direct-file');
+    const errBox = document.getElementById('floor-map-direct-error');
+    errBox.style.display = "none";
+
+    if (!fileInput.files || fileInput.files.length === 0) {
+        errBox.innerText = "Vui lòng chọn file PDF";
+        errBox.style.display = "block";
+        return;
+    }
+
+    const file = fileInput.files[0];
+    if (!file.name.toLowerCase().endsWith('.pdf')) {
+        errBox.innerText = "Chỉ chấp nhận file định dạng .pdf";
+        errBox.style.display = "block";
+        return;
+    }
+
+    const formData = new FormData();
+    formData.append('file', file);
+
+    try {
+        const submitBtn = e.target.querySelector('button[type="submit"]');
+        submitBtn.disabled = true;
+        submitBtn.innerText = "Đang xử lý & rasterize...";
+
+        const res = await apiFetch(`/api/admin/floors/${floorId}/map`, {
+            method: 'POST',
+            body: formData
+        });
+
+        submitBtn.disabled = false;
+        submitBtn.innerText = "Tải lên & Lưu";
+
+        if (res.ok) {
+            const data = await res.json();
+            showToast(data.message || "Đã cập nhật bản đồ tầng thành công!", "OK");
+            closeFloorMapDirectModal();
+            await loadAdminTerminals();
+            await loadTerminals();
+            loadAdminMapsOptions();
+            // If currently viewing this floor on dashboard, re-render
+            if (currentFloor && currentFloor.id === parseInt(floorId)) {
+                await onFloorChanged();
+            }
+        } else {
+            const err = await res.json();
+            errBox.innerText = err.detail || "Không thể tải lên sơ đồ bản đồ";
+            errBox.style.display = "block";
+        }
+    } catch (err) {
+        errBox.innerText = "Lỗi kết nối máy chủ: " + err.message;
+        errBox.style.display = "block";
+    }
 }

@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Hệ Thống Giám Sát Giấy Vệ Sinh Sân Bay</title>
-    <link rel="stylesheet" href="/static/css/style.css?v=20261019_v16">
+    <link rel="stylesheet" href="/static/css/style.css?v=20261022_v2">
     <!-- PDF.js CDN -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
     <!-- Chart.js CDN -->
@@ -141,13 +141,26 @@
                     <div id="panel-body" style="display: none;">
                         <div style="font-size: 0.825rem; margin-bottom: 0.75rem; color: var(--text-secondary); display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.5rem; background: #f8fafc; padding: 6px 10px; border-radius: 6px; border: 1px solid #e2e8f0;">
                             <div>
-                                <strong>Gateway:</strong> <span id="panel-gw-ip">Chưa gán</span>
+                                <strong>Gateway MAC:</strong> <code id="panel-gw-mac" style="font-weight: 600; color: var(--primary-color);">Chưa gán</code>
+                                <span id="panel-gw-ip-wrapper" style="font-size: 0.78rem; color: var(--text-secondary); margin-left: 4px;"></span>
                                 <span id="panel-gw-status" style="margin-left: 6px; font-size: 0.75rem;"></span>
                             </div>
                             <div style="display: flex; gap: 0.5rem; align-items: center;">
                                 <button class="btn btn-secondary btn-sm" id="btn-ping-gw" style="padding: 2px 8px; font-size: 0.75rem;" onclick="checkCurrentGatewayConnection()">🔍 Kiểm tra kết nối</button>
                                 <span style="font-size: 0.75rem; color: var(--text-muted);">Toạ độ: <span id="panel-coords">--</span></span>
                             </div>
+                        </div>
+
+                        <!-- Paper Roll Profile Applied to this Toilet -->
+                        <div id="panel-toilet-paper-wrap" style="display: none; font-size: 0.82rem; margin-bottom: 0.75rem; background: #f0fdf4; border: 1px solid #bbf7d0; padding: 6px 10px; border-radius: 6px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.35rem;">
+                            <div style="display: flex; align-items: center; gap: 0.45rem;">
+                                <span style="font-size: 1.1rem;">🧻</span>
+                                <div>
+                                    <span style="color: #166534; font-weight: 700;">Cấu hình cuộn giấy:</span>
+                                    <strong id="panel-toilet-paper-name" style="color: #0369a1; margin-left: 4px;">--</strong>
+                                </div>
+                            </div>
+                            <span id="panel-toilet-paper-badge" class="badge" style="font-size: 0.72rem; padding: 2px 7px; font-weight: 700; border-radius: 4px;">--</span>
                         </div>
 
                         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
@@ -263,7 +276,7 @@
         <section id="view-admin" style="display: none;">
             <div class="admin-tab-bar">
                 <button class="tab-btn active" onclick="switchAdminTab('users')">👥 Quản lý Tài khoản</button>
-                <button class="tab-btn" onclick="switchAdminTab('maps')">🗺️ Cập nhật Bản đồ PDF</button>
+                <button class="tab-btn" onclick="switchAdminTab('terminals')">🏢 Nhà ga, Tầng & Bản đồ</button>
                 <button class="tab-btn" onclick="switchAdminTab('gateways')">📡 Gateway & Thiết bị ESP</button>
                 <button class="tab-btn" onclick="switchAdminTab('paper')">🧻 Cấu hình Cuộn Giấy</button>
             </div>
@@ -293,265 +306,374 @@
                 </div>
             </div>
 
-            <!-- Tab: Maps -->
-            <div id="admin-tab-maps" style="display: none;">
-                <div style="max-width: 600px; background: white; padding: 1.5rem; border-radius: 8px; border: 1px solid var(--border-color);">
-                    <h3 style="margin-bottom: 1rem;">Tải lên sơ đồ bản đồ PDF cho tầng</h3>
-                    <form onsubmit="handleUploadMap(event)" style="display: flex; flex-direction: column; gap: 1rem;">
-                        <div class="form-group">
-                            <label>Chọn tầng cần cập nhật bản đồ:</label>
-                            <select id="upload-floor-select" required>
-                                <!-- Dynamic -->
-                            </select>
-                        </div>
-                        <div class="form-group">
-                            <label>Chọn file PDF sơ đồ (Tối đa 20MB):</label>
-                            <input type="file" id="upload-floor-file" accept=".pdf" required>
-                        </div>
-                        <button type="submit" class="btn btn-primary" style="align-self: flex-start;">Tải lên & Lưu bản đồ</button>
-                    </form>
+            <!-- Tab: Terminals & Floors (Parent - Child Hierarchy) -->
+            <div id="admin-tab-terminals" style="display: none;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.25rem; flex-wrap: wrap; gap: 0.75rem;">
+                    <div>
+                        <h3 style="margin-bottom: 0.25rem;">🏢 Quản lý Phân cấp Nhà ga & Bản đồ tầng</h3>
+                        <p style="color: var(--text-secondary); font-size: 0.85rem; margin: 0;">Cấu trúc phân cấp cha - con: Mỗi Nhà ga hiển thị trực tiếp các tầng con, sơ đồ bản đồ PDF và số lượng toilet.</p>
+                    </div>
+                    <div style="display: flex; gap: 0.5rem; align-items: center;">
+                        <button class="btn btn-secondary btn-sm" onclick="toggleAllTerminalsCollapse()" id="btn-toggle-all-terminals">Thu gọn tất cả</button>
+                        <button class="btn btn-primary btn-sm" onclick="openCreateTerminalModal()">➕ Thêm Nhà ga mới</button>
+                    </div>
+                </div>
+
+                <!-- Terminals & Floors Tree Container -->
+                <div id="admin-terminals-tree-container">
+                    <!-- Rendered dynamically as parent cards with child floor rows -->
                 </div>
             </div>
 
-            <!-- Tab: Gateways & Devices -->
+            <!-- Tab: Gateways & Devices (Parent - Child Hierarchy) -->
             <div id="admin-tab-gateways" style="display: none;">
-                <div style="margin-bottom: 1.5rem;">
-                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.75rem;">
-                        <h3>Danh sách Gateway</h3>
-                        <div style="display: flex; gap: 0.5rem; flex-wrap: wrap;">
-                            <button class="btn btn-secondary btn-sm" id="btn-ping-all-gw" onclick="checkAllAdminGateways()" title="Kiểm tra kết nối tất cả Gateway">🔍 Kiểm tra tất cả</button>
-                            <input type="text" id="new-gw-ip" placeholder="Nhập IP Gateway (vd: 192.168.1.50)">
-                            <button class="btn btn-primary btn-sm" onclick="handleCreateGateway()">Thêm Gateway</button>
-                        </div>
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.25rem; flex-wrap: wrap; gap: 0.75rem;">
+                    <div>
+                        <h3 style="margin-bottom: 0.25rem;">📡 Quản lý Phân cấp Gateway & Thiết Bị ESP</h3>
+                        <p style="color: var(--text-secondary); font-size: 0.85rem; margin: 0;">Cấu trúc phân cấp cha - con: Mỗi Gateway hiển thị trực tiếp vị trí gán, thông tin phần cứng MAC/IP và danh sách các Thiết bị Cabin (ESP) trực thuộc.</p>
                     </div>
-                    <div class="table-responsive">
-                        <table>
-                            <thead>
-                                <tr>
-                                    <th>ID</th>
-                                    <th>IP Gateway</th>
-                                    <th>Trạng thái</th>
-                                    <th>Nhà ga</th>
-                                    <th>Vị trí tầng</th>
-                                    <th>Gán cho WC</th>
-                                    <th>Số thiết bị</th>
-                                    <th>Lần cuối liên lạc</th>
-                                    <th>Thao tác</th>
-                                </tr>
-                            </thead>
-                            <tbody id="admin-gateways-table">
-                                <!-- Dynamic -->
-                            </tbody>
-                        </table>
-                    </div>
-                </div>
-
-                <div>
-                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.75rem;">
-                        <h3>Danh sách Thiết bị (ESP Clients)</h3>
+                    <div style="display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center;">
+                        <button class="btn btn-secondary btn-sm" id="btn-toggle-all-gateways" onclick="toggleAllGatewaysCollapse()">Thu gọn tất cả</button>
+                        <button class="btn btn-secondary btn-sm" id="btn-ping-all-gw" onclick="checkAllAdminGateways()" title="Kiểm tra kết nối tất cả Gateway">🔍 Kiểm tra tất cả</button>
                         <button class="btn btn-primary btn-sm" onclick="openAddDeviceAdminModal()">➕ Thêm Thiết Bị / Cabin</button>
                     </div>
-                    <div class="table-responsive">
-                        <table>
-                            <thead>
-                                <tr>
-                                    <th>ID</th>
-                                    <th>STT</th>
-                                    <th>MAC Address</th>
-                                    <th>Nhãn Cabin</th>
-                                    <th>Thuộc Gateway</th>
-                                    <th>Toilet</th>
-                                    <th>Mức giấy</th>
-                                    <th>Pin</th>
-                                    <th>Trạng thái</th>
-                                    <th>Thao tác</th>
-                                </tr>
-                            </thead>
-                            <tbody id="admin-devices-table">
-                                <!-- Dynamic -->
-                            </tbody>
-                        </table>
+                </div>
+
+                <!-- Thanh thêm Gateway mới -->
+                <div style="background: white; border: 1px solid var(--border-color); border-radius: 8px; padding: 0.85rem 1.25rem; margin-bottom: 1.25rem; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 0.6rem; box-shadow: 0 1px 2px rgba(0,0,0,0.03);">
+                    <div style="font-weight: 600; font-size: 0.92rem; color: var(--text-primary); display: flex; align-items: center; gap: 6px;">
+                        <span>➕ Thêm Gateway Mới:</span>
                     </div>
+                    <div style="display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center;">
+                        <input type="text" id="new-gw-mac" placeholder="Địa chỉ MAC cứng (vd: 30:AE:A4:07:0F:70)" style="width: 250px;">
+                        <input type="text" id="new-gw-ip" placeholder="IP hiện tại (vd: 192.168.1.50, tuỳ chọn)" style="width: 210px;">
+                        <button class="btn btn-primary btn-sm" onclick="handleCreateGateway()">Thêm Gateway</button>
+                    </div>
+                </div>
+
+                <!-- Gateways & Devices Tree Container -->
+                <div id="admin-gateways-tree-container">
+                    <!-- Dynamic Parent-Child Hierarchy Cards -->
                 </div>
             </div>
 
-            <!-- Tab: Paper Roll Settings -->
+            <!-- Tab: Paper Roll Settings (Multi-Profiles & Hierarchical Assignments) -->
             <div id="admin-tab-paper" style="display: none;">
                 <div class="paper-config-card">
-                    <div style="display: flex; align-items: center; gap: 0.6rem; margin-bottom: 1.25rem;">
-                        <span style="font-size: 1.75rem;">🧻</span>
-                        <div>
-                            <h3 style="margin: 0; font-size: 1.2rem;">Cấu Hình Cuộn Giấy & Tự Động Quy Đổi Khoảng Cách Cảm Biến</h3>
-                            <div style="font-size: 0.825rem; color: var(--text-secondary); margin-top: 2px;">
-                                Bạn chỉ cần nhập độ dày của cuộn giấy, hệ thống sẽ tự động tính khoảng cách từ cảm biến ToF để kích hoạt cảnh báo tương ứng.
+                    <!-- HEADER & EXPORT/IMPORT ACTIONS -->
+                    <div class="paper-card-header-top">
+                        <div style="display: flex; align-items: center; gap: 0.65rem;">
+                            <span style="font-size: 2rem;">🧻</span>
+                            <div>
+                                <h3 style="margin: 0; font-size: 1.25rem; color: var(--text-primary);">Quản Lý Cấu Hình Cuộn Giấy (Multi-Profiles)</h3>
+                                <div style="font-size: 0.85rem; color: var(--text-secondary); margin-top: 2px;">
+                                    Tùy biến nhiều cấu hình cuộn giấy. Áp dụng linh hoạt theo Nhà Vệ Sinh (tất cả cabin trong WC) hoặc riêng từng Cabin.
+                                </div>
+                            </div>
+                        </div>
+                        <div class="paper-card-header-actions">
+                            <button type="button" class="btn btn-secondary btn-sm" onclick="exportPaperConfigs()" title="Xuất toàn bộ cấu hình cuộn giấy và phân bổ ra tệp JSON">
+                                📤 Xuất Config (JSON)
+                            </button>
+                            <button type="button" class="btn btn-secondary btn-sm" onclick="triggerImportPaperConfig()" title="Nhập cấu hình cuộn giấy từ tệp JSON">
+                                📥 Nhập Config (JSON)
+                            </button>
+                            <input type="file" id="paper-import-file-input" accept=".json,application/json" style="display: none;" onchange="handlePaperConfigFileSelected(event)">
+                        </div>
+                    </div>
+
+                    <!-- PROFILE SELECTOR TOOLBAR -->
+                    <div class="paper-profile-toolbar">
+                        <div class="paper-profile-toolbar-main">
+                            <div class="paper-profile-select-line">
+                                <label for="paper-profile-select" class="paper-profile-label">
+                                    🏷️ Cấu hình đang chọn:
+                                </label>
+                                <div class="paper-profile-dropdown-wrap">
+                                    <select id="paper-profile-select" onchange="onPaperProfileSelectChange()" class="paper-profile-select">
+                                        <!-- Dynamic options loaded from API -->
+                                    </select>
+                                    <span id="badge-profile-is-default" class="badge-profile-default">
+                                        ★ Mặc Định Hệ Thống
+                                    </span>
+                                </div>
+                            </div>
+                            <div class="paper-profile-actions">
+                                <button type="button" class="btn btn-primary btn-sm" onclick="openCreatePaperProfileModal()">
+                                    ➕ Tạo Cấu Hình Mới
+                                </button>
+                                <button type="button" class="btn btn-secondary btn-sm" id="btn-set-default-profile" onclick="handleSetDefaultProfile()" title="Đặt cấu hình này làm mặc định cho toàn hệ thống">
+                                    ★ Đặt Làm Mặc Định
+                                </button>
+                                <button type="button" class="btn btn-danger btn-sm" id="btn-delete-profile" onclick="handleDeletePaperProfile()" title="Xóa cấu hình đang chọn">
+                                    🗑️ Xóa Cấu Hình
+                                </button>
                             </div>
                         </div>
                     </div>
 
-                    <form onsubmit="handleSavePaperSettings(event)" style="display: flex; flex-direction: column; gap: 1.25rem;">
-                        <!-- Thông số kích thước hộp và cuộn giấy -->
-                        <div class="paper-dimensions-grid">
-                            <div class="form-group">
-                                <label style="font-weight: 600;">1. Khoảng cách HẾT GIẤY:</label>
-                                <div style="display: flex; align-items: center; gap: 0.4rem;">
-                                    <input type="number" id="setting-empty-dist" step="1" min="10" max="1000" required value="160" oninput="updatePaperPreviewTable()" style="flex: 1;">
-                                    <span style="font-weight: 600; color: var(--text-secondary); font-size: 0.8rem;">mm</span>
+                    <!-- SUB-TABS: PARAMS vs ASSIGNMENT -->
+                    <div class="paper-subtab-bar">
+                        <button type="button" id="subtab-paper-params-btn" class="tab-btn active" onclick="switchPaperSubTab('params')" style="border-bottom: 2px solid #2563eb; font-weight: 700; color: #2563eb; padding: 0.55rem 1.1rem; background: transparent; border-top: none; border-left: none; border-right: none; cursor: pointer;">
+                            ⚙️ 1. Thông Số Cuộn Giấy & Quy Đổi Cảm Biến
+                        </button>
+                        <button type="button" id="subtab-paper-assign-btn" class="tab-btn" onclick="switchPaperSubTab('assign')" style="font-weight: 600; color: #64748b; padding: 0.55rem 1.1rem; background: transparent; border: none; cursor: pointer;">
+                            🎯 2. Phân Bổ Áp Dụng (Cho WC & Cabin)
+                        </button>
+                    </div>
+
+                    <!-- SUB-TAB 1: THÔNG SỐ CHI TIẾT CỦA CẤU HÌNH -->
+                    <div id="subtab-paper-params">
+                        <form onsubmit="handleSavePaperSettings(event)" style="display: flex; flex-direction: column; gap: 1.25rem;">
+                            <div class="form-group" style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 0.75rem 1rem;">
+                                <label style="font-weight: 700; font-size: 0.9rem; color: #1e293b;">Tên cấu hình cuộn giấy:</label>
+                                <input type="text" id="setting-profile-name" required placeholder="VD: Cuộn lớn sân bay 700m - T1" style="padding: 0.45rem 0.75rem; font-weight: 600; font-size: 0.95rem; width: 100%; max-width: 500px; border: 1px solid #cbd5e1; border-radius: 6px;">
+                            </div>
+
+                            <!-- Thông số kích thước hộp và cuộn giấy -->
+                            <div class="paper-dimensions-grid">
+                                <div class="form-group">
+                                    <label style="font-weight: 600;">1. Khoảng cách HẾT GIẤY:</label>
+                                    <div style="display: flex; align-items: center; gap: 0.4rem;">
+                                        <input type="number" id="setting-empty-dist" step="1" min="10" max="1000" required value="160" oninput="updatePaperPreviewTable()" style="flex: 1;">
+                                        <span style="font-weight: 600; color: var(--text-secondary); font-size: 0.8rem;">mm</span>
+                                    </div>
+                                    <div style="font-size: 0.72rem; color: var(--text-muted); margin-top: 2px;">
+                                        Từ mắt cảm biến tới đáy hộp khi hết sạch giấy.
+                                    </div>
+                                    <div id="preview-empty-dist-calc" style="font-size: 0.72rem; color: #991b1b; font-weight: 600; margin-top: 4px; background: #fef2f2; padding: 4px 6px; border-radius: 4px; border: 1px solid #fecaca;">
+                                        👉 Đo &ge; 160 mm &rarr; Báo Hết (0%)
+                                    </div>
                                 </div>
-                                <div style="font-size: 0.72rem; color: var(--text-muted); margin-top: 2px;">
-                                    Từ mắt cảm biến tới đáy hộp khi hết sạch giấy.
+
+                                <div class="form-group">
+                                    <label style="font-weight: 600;">2. Độ dày cuộn KHI ĐẦY:</label>
+                                    <div style="display: flex; align-items: center; gap: 0.4rem;">
+                                        <input type="number" id="setting-roll-thick" step="1" min="10" max="500" required value="110" oninput="updatePaperPreviewTable()" style="flex: 1;">
+                                        <span style="font-weight: 600; color: var(--text-secondary); font-size: 0.8rem;">mm</span>
+                                    </div>
+                                    <div style="font-size: 0.72rem; color: var(--text-muted); margin-top: 2px;">
+                                        Độ dày cuộn giấy lúc mới nguyên (11.0 cm).
+                                    </div>
+                                    <div id="preview-full-dist-calc" style="font-size: 0.72rem; color: #166534; font-weight: 600; margin-top: 4px; background: #f0fdf4; padding: 4px 6px; border-radius: 4px; border: 1px solid #bbf7d0;">
+                                        👉 Đo &le; 50 mm &rarr; Báo Đầy 100%
+                                    </div>
                                 </div>
-                                <div id="preview-empty-dist-calc" style="font-size: 0.72rem; color: #991b1b; font-weight: 600; margin-top: 4px; background: #fef2f2; padding: 4px 6px; border-radius: 4px; border: 1px solid #fecaca;">
-                                    👉 Đo &ge; 160 mm &rarr; Báo Hết (0%)
+
+                                <div class="form-group">
+                                    <label style="font-weight: 600; color: #4338ca;">3. Bù trừ sai số cảm biến (Offset):</label>
+                                    <div style="display: flex; align-items: center; gap: 0.4rem;">
+                                        <input type="number" id="setting-sensor-offset" step="1" min="-200" max="200" required value="40" oninput="updatePaperPreviewTable()" style="flex: 1; border-color: #a5b4fc;">
+                                        <span style="font-weight: 600; color: #4338ca; font-size: 0.8rem;">mm</span>
+                                    </div>
+                                    <div style="font-size: 0.72rem; color: var(--text-muted); margin-top: 2px;">
+                                        Trừ bớt sai số phần cứng (vd: lệch 4cm thì nhập 40 mm).
+                                    </div>
+                                    <div id="preview-offset-calc" style="font-size: 0.72rem; color: #4338ca; font-weight: 600; margin-top: 4px; background: #e0e7ff; padding: 4px 6px; border-radius: 4px; border: 1px solid #c7d2fe;">
+                                        👉 Đang bù trừ: 40 mm
+                                    </div>
                                 </div>
                             </div>
 
-                            <div class="form-group">
-                                <label style="font-weight: 600;">2. Độ dày cuộn KHI ĐẦY:</label>
-                                <div style="display: flex; align-items: center; gap: 0.4rem;">
-                                    <input type="number" id="setting-roll-thick" step="1" min="10" max="500" required value="110" oninput="updatePaperPreviewTable()" style="flex: 1;">
-                                    <span style="font-weight: 600; color: var(--text-secondary); font-size: 0.8rem;">mm</span>
+                            <!-- 3 mốc cảnh báo độ dày và số lần sử dụng -->
+                            <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 1.1rem;">
+                                <h4 style="margin: 0 0 0.75rem 0; font-size: 0.925rem; color: #1e293b;">
+                                    📐 3 Mốc Độ Dày Giấy Vệ Sinh & Số Lần Sử Dụng (Người dùng tuỳ chỉnh):
+                                </h4>
+                                
+                                <div class="paper-thresholds-grid">
+                                    <!-- Mốc 1.5 cm -->
+                                    <div style="background: #fefce8; border: 1px solid #fef08a; border-radius: 6px; padding: 0.75rem;">
+                                        <div style="font-weight: 700; font-size: 0.8rem; color: #854d0e; margin-bottom: 0.4rem;">Mốc 1 (Cảnh báo SẮP HẾT):</div>
+                                        <div class="form-group" style="margin-bottom: 0.35rem;">
+                                            <label style="font-size: 0.75rem;">Độ dày giấy (&le;):</label>
+                                            <div style="display: flex; align-items: center; gap: 0.25rem;">
+                                                <input type="number" id="setting-warn-low" step="0.1" min="0.1" max="10" required value="1.5" oninput="updatePaperPreviewTable()" style="flex: 1; padding: 0.25rem 0.5rem;">
+                                                <span style="font-size: 0.75rem; font-weight: 600;">cm</span>
+                                            </div>
+                                        </div>
+                                        <div class="form-group">
+                                            <label style="font-size: 0.75rem;">Số lần dùng tương ứng:</label>
+                                            <div style="display: flex; align-items: center; gap: 0.25rem;">
+                                                <input type="number" id="setting-warn-low-uses" step="1" min="1" max="500" required value="60" oninput="updatePaperPreviewTable()" style="flex: 1; padding: 0.25rem 0.5rem;">
+                                                <span style="font-size: 0.75rem; font-weight: 600;">lần</span>
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    <!-- Mốc 1.0 cm -->
+                                    <div style="background: #fffbeb; border: 1px solid #fde68a; border-radius: 6px; padding: 0.75rem;">
+                                        <div style="font-weight: 700; font-size: 0.8rem; color: #b45309; margin-bottom: 0.4rem;">Mốc 2 (Sắp hết cấp độ 2):</div>
+                                        <div class="form-group" style="margin-bottom: 0.35rem;">
+                                            <label style="font-size: 0.75rem;">Độ dày giấy (&le;):</label>
+                                            <div style="display: flex; align-items: center; gap: 0.25rem;">
+                                                <input type="number" id="setting-warn-mid" step="0.1" min="0.1" max="10" required value="1.0" oninput="updatePaperPreviewTable()" style="flex: 1; padding: 0.25rem 0.5rem;">
+                                                <span style="font-size: 0.75rem; font-weight: 600;">cm</span>
+                                            </div>
+                                        </div>
+                                        <div class="form-group">
+                                            <label style="font-size: 0.75rem;">Số lần dùng tương ứng:</label>
+                                            <div style="display: flex; align-items: center; gap: 0.25rem;">
+                                                <input type="number" id="setting-warn-mid-uses" step="1" min="1" max="500" required value="35" oninput="updatePaperPreviewTable()" style="flex: 1; padding: 0.25rem 0.5rem;">
+                                                <span style="font-size: 0.75rem; font-weight: 600;">lần</span>
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    <!-- Mốc 0.5 cm -->
+                                    <div style="background: #fef2f2; border: 1px solid #fecaca; border-radius: 6px; padding: 0.75rem;">
+                                        <div style="font-weight: 700; font-size: 0.8rem; color: #dc2626; margin-bottom: 0.4rem;">Mốc 3 (Cảnh báo HẾT GIẤY):</div>
+                                        <div class="form-group" style="margin-bottom: 0.35rem;">
+                                            <label style="font-size: 0.75rem;">Độ dày giấy (&le;):</label>
+                                            <div style="display: flex; align-items: center; gap: 0.25rem;">
+                                                <input type="number" id="setting-warn-empty" step="0.1" min="0.1" max="5" required value="0.5" oninput="updatePaperPreviewTable()" style="flex: 1; padding: 0.25rem 0.5rem;">
+                                                <span style="font-size: 0.75rem; font-weight: 600;">cm</span>
+                                            </div>
+                                        </div>
+                                        <div class="form-group">
+                                            <label style="font-size: 0.75rem;">Số lần dùng tương ứng:</label>
+                                            <div style="display: flex; align-items: center; gap: 0.25rem;">
+                                                <input type="number" id="setting-warn-empty-uses" step="1" min="1" max="500" required value="15" oninput="updatePaperPreviewTable()" style="flex: 1; padding: 0.25rem 0.5rem;">
+                                                <span style="font-size: 0.75rem; font-weight: 600;">lần</span>
+                                            </div>
+                                        </div>
+                                    </div>
                                 </div>
-                                <div style="font-size: 0.72rem; color: var(--text-muted); margin-top: 2px;">
-                                    Độ dày cuộn giấy lúc mới nguyên (11.0 cm).
-                                </div>
-                                <div id="preview-full-dist-calc" style="font-size: 0.72rem; color: #166534; font-weight: 600; margin-top: 4px; background: #f0fdf4; padding: 4px 6px; border-radius: 4px; border: 1px solid #bbf7d0;">
-                                    👉 Đo &le; 50 mm &rarr; Báo Đầy 100%
+
+                                <!-- Bảng App tự động tính khoảng cách cảm biến tương ứng -->
+                                <div style="margin-top: 1rem; border-top: 1px dashed #cbd5e1; padding-top: 0.75rem;">
+                                    <div style="font-weight: 700; font-size: 0.85rem; color: #0f172a; margin-bottom: 0.5rem; display: flex; align-items: center; justify-content: space-between;">
+                                        <span>🤖 BẢNG APP TỰ ĐỘNG QUY ĐỔI KHOẢNG CÁCH CẢM BIẾN (Tự động tính từ độ dày):</span>
+                                        <span style="font-size: 0.75rem; color: #2563eb; font-weight: normal;">* Tự động cập nhật theo cấu hình đang chọn</span>
+                                    </div>
+                                    <div class="table-responsive" style="margin: 0; background: white; border-radius: 6px; border: 1px solid #e2e8f0;">
+                                        <table style="width: 100%; font-size: 0.8rem; margin: 0;">
+                                            <thead>
+                                                <tr style="background: #f1f5f9;">
+                                                    <th style="padding: 6px 10px;">Độ dày giấy thực tế</th>
+                                                    <th style="padding: 6px 10px; color: #2563eb;">Khoảng cách cảm biến ToF app tự tính</th>
+                                                    <th style="padding: 6px 10px;">Lượt dùng ước tính</th>
+                                                    <th style="padding: 6px 10px;">Trạng thái hệ thống báo</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody id="paper-auto-calc-table">
+                                                <!-- Dynamic Rows Generated by updatePaperPreviewTable() -->
+                                            </tbody>
+                                        </table>
+                                    </div>
                                 </div>
                             </div>
 
-                            <div class="form-group">
-                                <label style="font-weight: 600; color: #4338ca;">3. Bù trừ sai số cảm biến (Offset):</label>
-                                <div style="display: flex; align-items: center; gap: 0.4rem;">
-                                    <input type="number" id="setting-sensor-offset" step="1" min="-200" max="200" required value="40" oninput="updatePaperPreviewTable()" style="flex: 1; border-color: #a5b4fc;">
-                                    <span style="font-weight: 600; color: #4338ca; font-size: 0.8rem;">mm</span>
+                            <!-- Công cụ kiểm tra thử khoảng cách cảm biến -->
+                            <div style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 8px; padding: 0.9rem; display: flex; align-items: center; justify-content: space-between; gap: 1rem; flex-wrap: wrap;">
+                                <div style="display: flex; align-items: center; gap: 0.5rem;">
+                                    <span style="font-size: 1.25rem;">🔍</span>
+                                    <div>
+                                        <div style="font-weight: 700; font-size: 0.825rem; color: #166534;">Thử nghiệm tính toán trực tiếp:</div>
+                                        <div style="font-size: 0.75rem; color: #15803d;">Nhập khoảng cách cảm biến đo được (mm) để xem app sẽ báo thế nào:</div>
+                                    </div>
                                 </div>
-                                <div style="font-size: 0.72rem; color: var(--text-muted); margin-top: 2px;">
-                                    Trừ bớt sai số phần cứng (vd: lệch 4cm thì nhập 40 mm).
+                                <div style="display: flex; align-items: center; gap: 0.5rem;">
+                                    <input type="number" id="test-sensor-dist" placeholder="Ví dụ: 128" value="128" oninput="testCalculateSensorDist()" style="width: 100px; padding: 0.35rem 0.5rem; border: 1px solid #86efac; border-radius: 4px;">
+                                    <span style="font-size: 0.8rem; font-weight: 600;">mm</span>
                                 </div>
-                                <div id="preview-offset-calc" style="font-size: 0.72rem; color: #4338ca; font-weight: 600; margin-top: 4px; background: #e0e7ff; padding: 4px 6px; border-radius: 4px; border: 1px solid #c7d2fe;">
-                                    👉 Đang bù trừ: 40 mm
+                                <div id="test-sensor-result" style="font-size: 0.825rem; font-weight: 600; color: #166534; background: white; padding: 4px 10px; border-radius: 4px; border: 1px solid #86efac;">
+                                    <!-- Live calculation result -->
+                                </div>
+                            </div>
+
+                            <div style="display: flex; justify-content: flex-end; gap: 0.5rem;">
+                                <button type="button" class="btn btn-secondary btn-sm" onclick="loadAdminPaperSettings()">↺ Đặt lại thông số</button>
+                                <button type="submit" class="btn btn-primary" style="padding: 0.6rem 1.5rem; font-size: 0.95rem;">💾 Lưu Thông Số Cấu Hình Này</button>
+                            </div>
+                        </form>
+                    </div>
+
+                    <!-- SUB-TAB 2: PHÂN BỔ ÁP DỤNG (CHO TỪNG WC & TỪNG CABIN) -->
+                    <div id="subtab-paper-assign" style="display: none;">
+                        <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 1rem; margin-bottom: 1.25rem;">
+                            <div style="font-weight: 700; font-size: 0.95rem; color: #1e293b; margin-bottom: 0.35rem;">
+                                🎯 Quy Tắc Áp Dụng Cấu Hình Theo Cấp Bậc (Hierarchy):
+                            </div>
+                            <div style="font-size: 0.85rem; color: #475569; display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 0.75rem;">
+                                <div style="background: white; border: 1px solid #cbd5e1; border-radius: 6px; padding: 0.6rem 0.85rem;">
+                                    <strong>1. Mặc định toàn hệ thống:</strong><br>
+                                    Tất cả WC và Cabin sẽ tự động dùng cấu hình mặc định nếu không chọn cấu hình riêng.
+                                </div>
+                                <div style="background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 6px; padding: 0.6rem 0.85rem; color: #1e40af;">
+                                    <strong>2. Áp dụng theo WC (Nhà vệ sinh):</strong><br>
+                                    Chọn cấu hình riêng cho 1 WC &rarr; <strong>TẤT CẢ các Cabin</strong> trong WC đó sẽ tự động áp dụng cấu hình này!
+                                </div>
+                                <div style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 6px; padding: 0.6rem 0.85rem; color: #166534;">
+                                    <strong>3. Áp dụng riêng từng Cabin:</strong><br>
+                                    Nếu buồng nào dùng cuộn giấy đặc biệt (vd: VIP), bạn có thể gán riêng cho riêng Cabin đó để ghi đè.
                                 </div>
                             </div>
                         </div>
 
-                        <!-- 3 mốc cảnh báo độ dày và số lần sử dụng -->
-                        <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 1.1rem;">
-                            <h4 style="margin: 0 0 0.75rem 0; font-size: 0.925rem; color: #1e293b;">
-                                📐 3 Mốc Độ Dày Giấy Vệ Sinh & Số Lần Sử Dụng (Người dùng tuỳ chỉnh):
-                            </h4>
-                            
-                            <div class="paper-thresholds-grid">
-                                <!-- Mốc 1.5 cm -->
-                                <div style="background: #fefce8; border: 1px solid #fef08a; border-radius: 6px; padding: 0.75rem;">
-                                    <div style="font-weight: 700; font-size: 0.8rem; color: #854d0e; margin-bottom: 0.4rem;">Mốc 1 (Cảnh báo SẮP HẾT):</div>
-                                    <div class="form-group" style="margin-bottom: 0.35rem;">
-                                        <label style="font-size: 0.75rem;">Độ dày giấy (&le;):</label>
-                                        <div style="display: flex; align-items: center; gap: 0.25rem;">
-                                            <input type="number" id="setting-warn-low" step="0.1" min="0.1" max="10" required value="1.5" oninput="updatePaperPreviewTable()" style="flex: 1; padding: 0.25rem 0.5rem;">
-                                            <span style="font-size: 0.75rem; font-weight: 600;">cm</span>
-                                        </div>
-                                    </div>
-                                    <div class="form-group">
-                                        <label style="font-size: 0.75rem;">Số lần dùng tương ứng:</label>
-                                        <div style="display: flex; align-items: center; gap: 0.25rem;">
-                                            <input type="number" id="setting-warn-low-uses" step="1" min="1" max="500" required value="60" oninput="updatePaperPreviewTable()" style="flex: 1; padding: 0.25rem 0.5rem;">
-                                            <span style="font-size: 0.75rem; font-weight: 600;">lần</span>
-                                        </div>
-                                    </div>
-                                </div>
-
-                                <!-- Mốc 1.0 cm -->
-                                <div style="background: #fffbeb; border: 1px solid #fde68a; border-radius: 6px; padding: 0.75rem;">
-                                    <div style="font-weight: 700; font-size: 0.8rem; color: #b45309; margin-bottom: 0.4rem;">Mốc 2 (Sắp hết cấp độ 2):</div>
-                                    <div class="form-group" style="margin-bottom: 0.35rem;">
-                                        <label style="font-size: 0.75rem;">Độ dày giấy (&le;):</label>
-                                        <div style="display: flex; align-items: center; gap: 0.25rem;">
-                                            <input type="number" id="setting-warn-mid" step="0.1" min="0.1" max="10" required value="1.0" oninput="updatePaperPreviewTable()" style="flex: 1; padding: 0.25rem 0.5rem;">
-                                            <span style="font-size: 0.75rem; font-weight: 600;">cm</span>
-                                        </div>
-                                    </div>
-                                    <div class="form-group">
-                                        <label style="font-size: 0.75rem;">Số lần dùng tương ứng:</label>
-                                        <div style="display: flex; align-items: center; gap: 0.25rem;">
-                                            <input type="number" id="setting-warn-mid-uses" step="1" min="1" max="500" required value="35" oninput="updatePaperPreviewTable()" style="flex: 1; padding: 0.25rem 0.5rem;">
-                                            <span style="font-size: 0.75rem; font-weight: 600;">lần</span>
-                                        </div>
-                                    </div>
-                                </div>
-
-                                <!-- Mốc 0.5 cm -->
-                                <div style="background: #fef2f2; border: 1px solid #fecaca; border-radius: 6px; padding: 0.75rem;">
-                                    <div style="font-weight: 700; font-size: 0.8rem; color: #dc2626; margin-bottom: 0.4rem;">Mốc 3 (Cảnh báo HẾT GIẤY):</div>
-                                    <div class="form-group" style="margin-bottom: 0.35rem;">
-                                        <label style="font-size: 0.75rem;">Độ dày giấy (&le;):</label>
-                                        <div style="display: flex; align-items: center; gap: 0.25rem;">
-                                            <input type="number" id="setting-warn-empty" step="0.1" min="0.1" max="5" required value="0.5" oninput="updatePaperPreviewTable()" style="flex: 1; padding: 0.25rem 0.5rem;">
-                                            <span style="font-size: 0.75rem; font-weight: 600;">cm</span>
-                                        </div>
-                                    </div>
-                                    <div class="form-group">
-                                        <label style="font-size: 0.75rem;">Số lần dùng tương ứng:</label>
-                                        <div style="display: flex; align-items: center; gap: 0.25rem;">
-                                            <input type="number" id="setting-warn-empty-uses" step="1" min="1" max="500" required value="15" oninput="updatePaperPreviewTable()" style="flex: 1; padding: 0.25rem 0.5rem;">
-                                            <span style="font-size: 0.75rem; font-weight: 600;">lần</span>
-                                        </div>
-                                    </div>
-                                </div>
-                            </div>
-
-                            <!-- Bảng App tự động tính khoảng cách cảm biến tương ứng -->
-                            <div style="margin-top: 1rem; border-top: 1px dashed #cbd5e1; padding-top: 0.75rem;">
-                                <div style="font-weight: 700; font-size: 0.85rem; color: #0f172a; margin-bottom: 0.5rem; display: flex; align-items: center; justify-content: space-between;">
-                                    <span>🤖 BẢNG APP TỰ ĐỘNG QUY ĐỔI KHOẢNG CÁCH CẢM BIẾN (Tự động tính từ độ dày):</span>
-                                    <span style="font-size: 0.75rem; color: #2563eb; font-weight: normal;">* Tự động cập nhật theo các số bạn nhập ở trên</span>
-                                </div>
-                                <div class="table-responsive" style="margin: 0; background: white; border-radius: 6px; border: 1px solid #e2e8f0;">
-                                    <table style="width: 100%; font-size: 0.8rem; margin: 0;">
-                                        <thead>
-                                            <tr style="background: #f1f5f9;">
-                                                <th style="padding: 6px 10px;">Độ dày giấy thực tế</th>
-                                                <th style="padding: 6px 10px; color: #2563eb;">Khoảng cách cảm biến ToF app tự tính</th>
-                                                <th style="padding: 6px 10px;">Lượt dùng ước tính</th>
-                                                <th style="padding: 6px 10px;">Trạng thái hệ thống báo</th>
-                                            </tr>
-                                        </thead>
-                                        <tbody id="paper-auto-calc-table">
-                                            <!-- Dynamic Rows Generated by updatePaperPreviewTable() -->
-                                        </tbody>
-                                    </table>
-                                </div>
-                            </div>
+                        <!-- Filter & Refresh Bar -->
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.75rem; gap: 0.75rem; flex-wrap: wrap;">
+                            <input type="text" id="paper-assign-filter-input" placeholder="🔍 Lọc nhanh theo tên Nhà ga, Tầng, WC hoặc Cabin..." oninput="filterPaperAssignmentsTable()" style="padding: 0.45rem 0.85rem; border-radius: 6px; border: 1px solid #cbd5e1; min-width: 320px;">
+                            <button type="button" class="btn btn-secondary btn-sm" onclick="loadPaperAssignments()">
+                                🔄 Tải Lại Danh Sách Phân Bổ
+                            </button>
                         </div>
 
-                        <!-- Công cụ kiểm tra thử khoảng cách cảm biến -->
-                        <div style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 8px; padding: 0.9rem; display: flex; align-items: center; justify-content: space-between; gap: 1rem; flex-wrap: wrap;">
-                            <div style="display: flex; align-items: center; gap: 0.5rem;">
-                                <span style="font-size: 1.25rem;">🔍</span>
-                                <div>
-                                    <div style="font-weight: 700; font-size: 0.825rem; color: #166534;">Thử nghiệm tính toán trực tiếp:</div>
-                                    <div style="font-size: 0.75rem; color: #15803d;">Nhập khoảng cách cảm biến đo được (mm) để xem app sẽ báo thế nào:</div>
-                                </div>
-                            </div>
-                            <div style="display: flex; align-items: center; gap: 0.5rem;">
-                                <input type="number" id="test-sensor-dist" placeholder="Ví dụ: 128" value="128" oninput="testCalculateSensorDist()" style="width: 100px; padding: 0.35rem 0.5rem; border: 1px solid #86efac; border-radius: 4px;">
-                                <span style="font-size: 0.8rem; font-weight: 600;">mm</span>
-                            </div>
-                            <div id="test-sensor-result" style="font-size: 0.825rem; font-weight: 600; color: #166534; background: white; padding: 4px 10px; border-radius: 4px; border: 1px solid #86efac;">
-                                <!-- Live calculation result -->
-                            </div>
+                        <!-- Assignments Table -->
+                        <div class="table-responsive" style="background: white; border-radius: 8px; border: 1px solid #e2e8f0; max-height: 550px; overflow-y: auto;">
+                            <table style="width: 100%; border-collapse: collapse; font-size: 0.875rem;" id="paper-assign-table">
+                                <thead>
+                                    <tr style="background: #f8fafc; color: #475569; text-transform: uppercase; font-size: 0.75rem; border-bottom: 2px solid #e2e8f0; position: sticky; top: 0; z-index: 10;">
+                                        <th style="padding: 0.65rem 1rem; text-align: left;">Vị trí (Nhà ga / Tầng / WC / Cabin)</th>
+                                        <th style="padding: 0.65rem 1rem; text-align: left; width: 300px;">Cấu hình gán trực tiếp</th>
+                                        <th style="padding: 0.65rem 1.25rem; text-align: left; width: 300px;">Cấu hình có hiệu lực (Effective)</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="paper-assign-table-body">
+                                    <!-- Dynamic rows generated by renderPaperAssignmentsTable() -->
+                                </tbody>
+                            </table>
                         </div>
-
-                        <div style="display: flex; justify-content: flex-end; gap: 0.5rem;">
-                            <button type="button" class="btn btn-secondary btn-sm" onclick="loadAdminPaperSettings()">↺ Đặt lại mặc định</button>
-                            <button type="submit" class="btn btn-primary">💾 Lưu Cấu Hình Cuộn Giấy</button>
-                        </div>
-                    </form>
+                    </div>
                 </div>
             </div>
         </section>
     </main>
 
     <!-- ================= MODALS ================= -->
+    
+    <!-- Modal: Create Paper Profile -->
+    <div class="modal-backdrop" id="modal-create-paper-profile" style="display: none;">
+        <div class="modal-content" style="max-width: 480px;">
+            <div class="modal-header">
+                <h3 class="modal-title">Tạo Cấu Hình Cuộn Giấy Mới</h3>
+                <button class="btn btn-secondary btn-sm" onclick="closeCreatePaperProfileModal()">✕</button>
+            </div>
+            <form onsubmit="handleCreatePaperProfileSubmit(event)">
+                <div class="modal-body">
+                    <div class="form-group">
+                        <label style="font-weight: 600;">Tên cấu hình mới:</label>
+                        <input type="text" id="new-profile-name" required placeholder="VD: Cuộn lớn sân bay 700m - T1">
+                    </div>
+                    <div class="form-group">
+                        <label style="font-weight: 600;">Sao chép thông số ban đầu từ:</label>
+                        <select id="new-profile-copy-from">
+                            <!-- Populated with existing profiles -->
+                        </select>
+                    </div>
+                    <div class="form-group" style="display: flex; align-items: center; gap: 0.5rem; margin-top: 0.75rem; background: #f8fafc; padding: 0.5rem 0.75rem; border-radius: 6px; border: 1px solid #e2e8f0;">
+                        <input type="checkbox" id="new-profile-is-default" style="width: 18px; height: 18px; cursor: pointer;">
+                        <label for="new-profile-is-default" style="margin: 0; cursor: pointer; font-weight: 600; font-size: 0.85rem; color: #1e293b;">Đặt ngay làm Cấu hình mặc định toàn hệ thống</label>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" onclick="closeCreatePaperProfileModal()">Hủy</button>
+                    <button type="submit" class="btn btn-primary">➕ Tạo Cấu Hình</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
     <!-- Modal: Login -->
     <div class="modal-backdrop" id="modal-login" style="display: none;">
         <div class="modal-content">
@@ -648,8 +770,12 @@
                         <input type="text" id="new-toilet-name" required placeholder="VD: WC Nam Cổng 12">
                     </div>
                     <div class="form-group">
-                        <label>IP Gateway gán trực tiếp (tuỳ chọn):</label>
-                        <input type="text" id="new-toilet-gw-ip" placeholder="VD: 192.168.1.100">
+                        <label>Gateway gắn với WC này (Địa chỉ MAC cứng):</label>
+                        <select id="new-toilet-gw-select" onchange="onNewToiletGwSelectChange(this.value)" style="margin-bottom: 0.35rem;">
+                            <option value="">[Không gán Gateway]</option>
+                        </select>
+                        <input type="text" id="new-toilet-gw-mac" placeholder="Địa chỉ MAC Gateway (vd: 30:AE:A4:07:0F:70)">
+                        <input type="hidden" id="new-toilet-gw-ip">
                     </div>
                     <div style="font-size: 0.8rem; color: var(--text-secondary);">
                         Toạ độ trên bản đồ: <span id="new-toilet-coords">0.5, 0.5</span>
@@ -732,6 +858,13 @@
                         <input type="text" id="add-cabin-mac" required placeholder="VD: AA:BB:CC:DD:EE:01" style="text-transform: uppercase;">
                         <small style="color: var(--text-secondary); font-size: 0.75rem;">Định dạng MAC: 12 ký tự hex (ví dụ: AA:BB:CC:DD:EE:01)</small>
                     </div>
+                    <div class="form-group">
+                        <label>Cấu hình cuộn giấy áp dụng:</label>
+                        <select id="add-cabin-paper-profile">
+                            <option value="">[Kế thừa theo WC / Mặc định hệ thống]</option>
+                        </select>
+                        <small style="color: var(--text-secondary); font-size: 0.75rem;">Nếu để trống, Cabin sẽ tự động thừa hưởng cấu hình của WC hoặc cấu hình mặc định.</small>
+                    </div>
                 </div>
                 <div class="modal-footer">
                     <button type="button" class="btn btn-secondary" onclick="closeAddCabinModal()">Hủy</button>
@@ -772,6 +905,13 @@
                             <!-- Dynamic -->
                         </select>
                     </div>
+                    <div class="form-group">
+                        <label>Cấu hình cuộn giấy áp dụng:</label>
+                        <select id="form-device-paper-profile">
+                            <option value="">[Kế thừa theo WC / Mặc định hệ thống]</option>
+                        </select>
+                        <small style="color: var(--text-secondary); font-size: 0.75rem;">Chỉ chọn nếu buồng này dùng loại cuộn giấy riêng biệt với WC.</small>
+                    </div>
                 </div>
                 <div class="modal-footer">
                     <button type="button" class="btn btn-secondary" onclick="closeDeviceModal()">Hủy</button>
@@ -798,8 +938,24 @@
                         <input type="text" id="edit-toilet-name" required placeholder="VD: WC Cổng 15 - Cánh Đông">
                     </div>
                     <div class="form-group">
-                        <label>IP Gateway gán:</label>
-                        <input type="text" id="edit-toilet-gw-ip" placeholder="VD: 192.168.1.100" oninput="checkDiscoveredClientsForModal(this.value)">
+                        <label>Cấu hình cuộn giấy áp dụng cho WC:</label>
+                        <select id="edit-toilet-paper-profile">
+                            <option value="">[Sử dụng Cấu hình mặc định toàn hệ thống]</option>
+                        </select>
+                        <small style="color: var(--text-secondary); font-size: 0.75rem;">Khi chọn cấu hình ở đây, <strong>tất cả cabin trong WC</strong> sẽ tự động thừa hưởng cấu hình này.</small>
+                    </div>
+                    <div class="form-group">
+                        <label>Gateway gắn với Nhà vệ sinh này (Địa chỉ MAC cứng):</label>
+                        <select id="edit-toilet-gw-select" onchange="onEditToiletGwSelectChange(this.value)" style="margin-bottom: 0.35rem;">
+                            <option value="">[Không gán Gateway]</option>
+                        </select>
+                        <div style="display: flex; gap: 0.5rem;">
+                            <input type="text" id="edit-toilet-gw-mac" placeholder="Địa chỉ MAC Gateway (vd: 30:AE:A4:07:0F:70)" oninput="checkDiscoveredClientsForModal(this.value)">
+                            <input type="hidden" id="edit-toilet-gw-ip">
+                        </div>
+                        <small style="color: var(--text-secondary); font-size: 0.75rem; display: block; margin-top: 0.25rem;">
+                            🔒 <strong>Cố định theo MAC cứng:</strong> Dù router DHCP cấp đổi IP mới, vị trí WC trên bản đồ vẫn giữ nguyên vẹn không cần chọn lại.
+                        </small>
                         <div id="edit-toilet-discovered-preview" style="display: none; margin-top: 6px; font-size: 0.8rem;"></div>
                     </div>
                     <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem;">
@@ -857,27 +1013,113 @@
         </div>
     </div>
 
+    <!-- Modal: Terminal Form (Admin) -->
+    <div class="modal-backdrop" id="modal-terminal-form" style="display: none;">
+        <div class="modal-content" style="max-width: 440px;">
+            <div class="modal-header">
+                <h3 class="modal-title" id="terminal-modal-title">Thêm Nhà Ga Mới</h3>
+                <button class="btn btn-secondary btn-sm" onclick="closeTerminalModal()">✕</button>
+            </div>
+            <form onsubmit="handleTerminalFormSubmit(event)">
+                <input type="hidden" id="form-terminal-id">
+                <div class="modal-body">
+                    <div class="form-group">
+                        <label>Tên Nhà ga <span style="color: red;">*</span>:</label>
+                        <input type="text" id="form-terminal-name" required placeholder="Ví dụ: T1, T2, T3, Ga Quốc nội...">
+                    </div>
+                    <div id="terminal-form-error" class="alert alert-danger" style="display: none; font-size: 0.85rem;"></div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" onclick="closeTerminalModal()">Hủy</button>
+                    <button type="submit" class="btn btn-primary" id="btn-submit-terminal">Lưu Nhà Ga</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Modal: Floor Form (Admin) -->
+    <div class="modal-backdrop" id="modal-floor-form" style="display: none;">
+        <div class="modal-content" style="max-width: 480px;">
+            <div class="modal-header">
+                <h3 class="modal-title" id="floor-modal-title">Thêm Tầng Mới</h3>
+                <button class="btn btn-secondary btn-sm" onclick="closeFloorModal()">✕</button>
+            </div>
+            <form onsubmit="handleFloorFormSubmit(event)">
+                <input type="hidden" id="form-floor-id">
+                <div class="modal-body">
+                    <div class="form-group">
+                        <label>Chọn Nhà ga <span style="color: red;">*</span>:</label>
+                        <select id="form-floor-terminal" required>
+                            <!-- Dynamic -->
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Tên Tầng <span style="color: red;">*</span>:</label>
+                        <input type="text" id="form-floor-name" required placeholder="Ví dụ: Tầng Hầm, Tầng G, Lầu 1, Tầng 2...">
+                    </div>
+                    <div class="form-group" id="group-floor-map-upload">
+                        <label>File sơ đồ bản đồ PDF (Tùy chọn):</label>
+                        <input type="file" id="form-floor-map-file" accept=".pdf">
+                        <small style="color: var(--text-secondary); font-size: 0.75rem; display: block; margin-top: 0.25rem;">Chấp nhận file .pdf tối đa 20MB. Có thể cập nhật sau.</small>
+                    </div>
+                    <div id="floor-form-error" class="alert alert-danger" style="display: none; font-size: 0.85rem;"></div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" onclick="closeFloorModal()">Hủy</button>
+                    <button type="submit" class="btn btn-primary" id="btn-submit-floor">Lưu Tầng</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Modal: Upload Map PDF for Floor Direct -->
+    <div class="modal-backdrop" id="modal-floor-map-direct" style="display: none;">
+        <div class="modal-content" style="max-width: 460px;">
+            <div class="modal-header">
+                <h3 class="modal-title" id="floor-map-direct-title">Tải Lên Bản Đồ PDF</h3>
+                <button class="btn btn-secondary btn-sm" onclick="closeFloorMapDirectModal()">✕</button>
+            </div>
+            <form onsubmit="handleFloorMapDirectSubmit(event)">
+                <input type="hidden" id="floor-map-direct-id">
+                <div class="modal-body">
+                    <p id="floor-map-direct-desc" style="font-size: 0.9rem; color: var(--text-secondary); margin-bottom: 1rem;"></p>
+                    <div class="form-group">
+                        <label>Chọn file PDF sơ đồ (Tối đa 20MB):</label>
+                        <input type="file" id="floor-map-direct-file" accept=".pdf" required>
+                    </div>
+                    <div id="floor-map-direct-error" class="alert alert-danger" style="display: none; font-size: 0.85rem;"></div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" onclick="closeFloorMapDirectModal()">Hủy</button>
+                    <button type="submit" class="btn btn-primary">Tải lên & Lưu</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
     <!-- Toast Notifications Container -->
     <div class="toast-container" id="toast-container"></div>
 
     <script>
     // Inline fallback ensuring switchAdminTab always switches even if cached
     window.switchAdminTab = function(tabName) {
-        const tabs = ['users', 'maps', 'gateways', 'paper'];
+        const tabs = ['users', 'terminals', 'gateways', 'paper'];
         tabs.forEach(t => {
             const el = document.getElementById(`admin-tab-${t}`);
             if (el) el.style.display = (t === tabName) ? 'block' : 'none';
         });
         const btns = document.querySelectorAll('#view-admin .tab-btn');
-        const idxMap = { 'users': 0, 'maps': 1, 'gateways': 2, 'paper': 3 };
+        const idxMap = { 'users': 0, 'terminals': 1, 'gateways': 2, 'paper': 3 };
         btns.forEach((b, i) => {
             b.className = (i === idxMap[tabName]) ? 'tab-btn active' : 'tab-btn';
         });
         if (tabName === 'paper' && typeof loadAdminPaperSettings === 'function') {
             loadAdminPaperSettings();
+        } else if (tabName === 'terminals' && typeof loadAdminTerminals === 'function') {
+            loadAdminTerminals();
         }
     };
     </script>
-    <script src="/static/js/app.js?v=20261019_v17"></script>
+    <script src="/static/js/app.js?v=20261022_v29"></script>
 </body>
 </html>

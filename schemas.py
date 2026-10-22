@@ -40,8 +40,11 @@ class DeviceReportItem(BaseModel):
     battery: float = Field(default=100.0, ge=0, le=100, description="Battery percentage (0-100)")
 
 class GatewayReportRequest(BaseModel):
-    gateway_ip: Optional[str] = Field(None, description="IP address of the reporting gateway")
-    devices: List[DeviceReportItem] = Field(..., description="List of reporting ESP client devices")
+    gateway_mac: Optional[str] = Field(None, description="Hardware MAC address of the gateway (Địa chỉ MAC cứng)")
+    gateway_id: Optional[str] = Field(None, description="Alias for gateway_mac or hardware ID")
+    gateway_code: Optional[str] = Field(None, description="Alias for gateway_mac")
+    gateway_ip: Optional[str] = Field(None, description="Current IP address of reporting gateway")
+    devices: List[DeviceReportItem] = Field(default=[], description="List of reporting ESP client devices")
 
 # --- Toilet & Gateway CRUD ---
 class ToiletCreate(BaseModel):
@@ -49,13 +52,29 @@ class ToiletCreate(BaseModel):
     floor_id: int
     x: float = Field(default=0.5, ge=0.0, le=1.0)
     y: float = Field(default=0.5, ge=0.0, le=1.0)
+    gateway_mac: Optional[str] = None
+    gateway_code: Optional[str] = None
     gateway_ip: Optional[str] = None
+    paper_profile_id: Optional[int] = None
 
 class ToiletUpdate(BaseModel):
     name: Optional[str] = None
     x: Optional[float] = Field(None, ge=0.0, le=1.0)
     y: Optional[float] = Field(None, ge=0.0, le=1.0)
+    gateway_mac: Optional[str] = None
+    gateway_code: Optional[str] = None
     gateway_ip: Optional[str] = None
+    paper_profile_id: Optional[int] = None
+
+class GatewayCreate(BaseModel):
+    mac_address: str = Field(..., min_length=5, max_length=50)
+    gateway_code: Optional[str] = None
+    ip_address: Optional[str] = None
+
+class GatewayUpdate(BaseModel):
+    mac_address: Optional[str] = Field(None, min_length=5, max_length=50)
+    gateway_code: Optional[str] = None
+    ip_address: Optional[str] = None
 
 class DeviceCreate(BaseModel):
     mac_address: str = Field(..., min_length=5, max_length=50)
@@ -63,12 +82,45 @@ class DeviceCreate(BaseModel):
     toilet_id: Optional[int] = None
     cabin_order: int = Field(default=1, ge=1)
     label: Optional[str] = None
+    paper_profile_id: Optional[int] = None
 
 class DeviceUpdate(BaseModel):
     label: Optional[str] = None
     gateway_id: Optional[int] = None
     cabin_order: Optional[int] = None
     mac_address: Optional[str] = None
+    paper_profile_id: Optional[int] = None
+
+class PaperProfileCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+    is_default: Optional[bool] = False
+    empty_distance_mm: float = 160.0
+    roll_thickness_mm: float = 110.0
+    sensor_offset_mm: float = 40.0
+    warn_low_cm: float = 1.5
+    warn_low_uses: float = 60.0
+    warn_mid_cm: float = 1.0
+    warn_mid_uses: float = 35.0
+    warn_empty_cm: float = 0.5
+    warn_empty_uses: float = 15.0
+
+class PaperProfileUpdate(BaseModel):
+    name: Optional[str] = None
+    is_default: Optional[bool] = None
+    empty_distance_mm: Optional[float] = None
+    roll_thickness_mm: Optional[float] = None
+    sensor_offset_mm: Optional[float] = None
+    warn_low_cm: Optional[float] = None
+    warn_low_uses: Optional[float] = None
+    warn_mid_cm: Optional[float] = None
+    warn_mid_uses: Optional[float] = None
+    warn_empty_cm: Optional[float] = None
+    warn_empty_uses: Optional[float] = None
+
+class PaperAssignmentRequest(BaseModel):
+    target_type: str  # "toilet" or "device"
+    target_id: int
+    profile_id: Optional[int] = None
 
 # --- Responses ---
 class DeviceOut(BaseModel):
@@ -130,3 +182,17 @@ class TerminalOut(BaseModel):
     id: int
     name: str
     floors: List[FloorOut]
+
+class TerminalCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=50)
+
+class TerminalUpdate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=50)
+
+class FloorCreate(BaseModel):
+    terminal_id: int
+    name: str = Field(..., min_length=1, max_length=100)
+
+class FloorUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=100)
+    terminal_id: Optional[int] = None

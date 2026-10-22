@@ -8,6 +8,27 @@ from database import Base
 def utc_now():
     return datetime.now(timezone.utc)
 
+class PaperProfile(Base):
+    __tablename__ = "paper_profiles"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(100), nullable=False)
+    is_default = Column(Boolean, default=False, nullable=False)
+    empty_distance_mm = Column(Float, default=160.0, nullable=False)
+    roll_thickness_mm = Column(Float, default=110.0, nullable=False)
+    sensor_offset_mm = Column(Float, default=40.0, nullable=False)
+    warn_low_cm = Column(Float, default=1.5, nullable=False)
+    warn_low_uses = Column(Float, default=60.0, nullable=False)
+    warn_mid_cm = Column(Float, default=1.0, nullable=False)
+    warn_mid_uses = Column(Float, default=35.0, nullable=False)
+    warn_empty_cm = Column(Float, default=0.5, nullable=False)
+    warn_empty_uses = Column(Float, default=15.0, nullable=False)
+    created_at = Column(DateTime, default=utc_now, nullable=False)
+
+    toilets = relationship("Toilet", back_populates="paper_profile")
+    devices = relationship("Device", back_populates="paper_profile")
+
+
 class User(Base):
     __tablename__ = "users"
 
@@ -46,15 +67,19 @@ class Toilet(Base):
     x = Column(Float, default=0.5, nullable=False)  # 0.0 to 1.0 (relative to page)
     y = Column(Float, default=0.5, nullable=False)  # 0.0 to 1.0
     gateway_id = Column(Integer, ForeignKey("gateways.id", ondelete="SET NULL"), nullable=True)
+    paper_profile_id = Column(Integer, ForeignKey("paper_profiles.id", ondelete="SET NULL"), nullable=True)
 
     floor = relationship("Floor", back_populates="toilets")
     gateway = relationship("Gateway", back_populates="toilet", foreign_keys=[gateway_id])
+    paper_profile = relationship("PaperProfile", back_populates="toilets")
 
 class Gateway(Base):
     __tablename__ = "gateways"
 
     id = Column(Integer, primary_key=True, index=True)
-    ip_address = Column(String(45), unique=True, index=True, nullable=False)
+    mac_address = Column(String(50), unique=True, index=True, nullable=True)  # Địa chỉ MAC cứng cố định của ESP32 Gateway
+    gateway_code = Column(String(50), nullable=True)  # Tên gợi nhớ (vd: GW01, GW02...)
+    ip_address = Column(String(45), index=True, nullable=True)  # IP hiện tại do DHCP router cấp (tự động cập nhật)
     toilet_id = Column(Integer, ForeignKey("toilets.id", ondelete="SET NULL"), nullable=True, unique=True)
     last_seen = Column(DateTime, nullable=True)
 
@@ -70,11 +95,14 @@ class Device(Base):
     cabin_order = Column(Integer, default=1, nullable=False)
     label = Column(String(100), default="Cabin 1", nullable=False)
     paper_level = Column(Float, default=100.0, nullable=False)  # 0 - 100
+    raw_distance_mm = Column(Float, nullable=True)             # Raw distance measured by ToF sensor (mm)
     battery = Column(Float, default=100.0, nullable=False)      # 0 - 100
     status = Column(String(20), default="OK", nullable=False)   # OK | LOW | EMPTY | OFFLINE
     last_seen = Column(DateTime, nullable=True)
+    paper_profile_id = Column(Integer, ForeignKey("paper_profiles.id", ondelete="SET NULL"), nullable=True)
 
     gateway = relationship("Gateway", back_populates="devices")
+    paper_profile = relationship("PaperProfile", back_populates="devices")
     history = relationship("StatusHistory", back_populates="device", cascade="all, delete-orphan")
     alerts = relationship("Alert", back_populates="device", cascade="all, delete-orphan")
 

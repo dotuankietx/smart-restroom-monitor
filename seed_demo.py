@@ -13,6 +13,37 @@ from services.auth_service import get_password_hash
 
 import re
 import unicodedata
+import shutil
+
+DEFAULT_MAPS_DIR = Path(__file__).resolve().parent / "default_maps"
+
+DEFAULT_MAP_FILES = {
+    ('T1', 'Tầng Trệt'): ('T1', 'MAT BANG GA T1-tangtret.pdf', 'default_map_t1_tang_tret.pdf'),
+    ('T1', 'Tầng 1'): ('T1', 'MAT BANG GA T1-tang1.pdf', 'default_map_t1_tang_1.pdf'),
+    ('T2', 'Tầng G'): ('T2', 'xref GF.pdf', 'default_map_t2_tang_g.pdf'),
+    ('T2', 'Lầu 1'): ('T2', 'Xref 1F_D-Layout1.pdf', 'default_map_t2_lau_1.pdf'),
+    ('T2', 'Lầu 2'): ('T2', 'xref 2F-Layout1.pdf', 'default_map_t2_lau_2.pdf'),
+    ('T2', 'Lầu 3'): ('T2', 'xref 3F-Layout1.pdf', 'default_map_t2_lau_3.pdf'),
+    ('T3', 'Tầng hầm'): ('T3', 'XREP.PTB-BM-Layout2.pdf', 'default_map_t3_tang_ham.pdf'),
+    ('T3', 'Lầu 1'): ('T3', 'XREP.PTB-1FL-Layout3.pdf', 'default_map_t3_lau_1.pdf'),
+    ('T3', 'Lầu 2'): ('T3', 'XREP.PTB-2FL-Layout2.pdf', 'default_map_t3_lau_2.pdf'),
+    ('T3', 'Lầu 3'): ('T3', 'XREP.PTB-3FL-Layout2.pdf', 'default_map_t3_lau_3.pdf'),
+    ('T3', 'Lầu 4'): ('T3', 'XREP.PTB-4FL-Layout2.pdf', 'default_map_t3_lau_4.pdf'),
+}
+
+def get_default_or_sample_pdf_map(terminal_name: str, floor_name: str) -> str:
+    """Get the official architectural default floor plan PDF if available, otherwise generate sample"""
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    key = (terminal_name, floor_name)
+    if key in DEFAULT_MAP_FILES:
+        subfolder, src_name, target_name = DEFAULT_MAP_FILES[key]
+        src_path = DEFAULT_MAPS_DIR / subfolder / src_name
+        dest_path = UPLOAD_DIR / target_name
+        if src_path.exists():
+            if not dest_path.exists():
+                shutil.copy2(src_path, dest_path)
+            return f"/uploads/{target_name}"
+    return generate_sample_pdf_map(terminal_name, floor_name)
 
 def slugify(text: str) -> str:
     text = unicodedata.normalize('NFKD', text).encode('ascii', 'ignore').decode('utf-8')
@@ -159,6 +190,18 @@ def init_system_defaults():
             print("[Init] Created default admin account: admin / admin123 (must_change_password=True)")
 
         # 2. Terminals & Floors
+        # Terminal T1 (Mặc định: Tầng Trệt, Tầng 1)
+        t1 = db.query(Terminal).filter(Terminal.name == "T1").first()
+        if not t1:
+            t1 = Terminal(name="T1")
+            db.add(t1)
+            db.flush()
+            for fname in ["Tầng Trệt", "Tầng 1"]:
+                pdf_url = get_default_or_sample_pdf_map("T1", fname)
+                floor = Floor(terminal_id=t1.id, name=fname, map_pdf_path=pdf_url)
+                db.add(floor)
+            print("[Init] Seeded Terminal T1 with 2 floors (Tầng Trệt, Tầng 1)")
+
         t2 = db.query(Terminal).filter(Terminal.name == "T2").first()
         if not t2:
             t2 = Terminal(name="T2")
@@ -166,7 +209,7 @@ def init_system_defaults():
             db.flush()
             # T2: Tầng G, Lầu 1, Lầu 2, Lầu 3
             for fname in ["Tầng G", "Lầu 1", "Lầu 2", "Lầu 3"]:
-                pdf_url = generate_sample_pdf_map("T2", fname)
+                pdf_url = get_default_or_sample_pdf_map("T2", fname)
                 floor = Floor(terminal_id=t2.id, name=fname, map_pdf_path=pdf_url)
                 db.add(floor)
             print("[Init] Seeded Terminal T2 with 4 floors (Tầng G, Lầu 1, 2, 3)")
@@ -178,7 +221,7 @@ def init_system_defaults():
             db.flush()
             # T3: 1 tầng hầm, lầu 1, lầu 2, lầu 3, lầu 4
             for fname in ["Tầng hầm", "Lầu 1", "Lầu 2", "Lầu 3", "Lầu 4"]:
-                pdf_url = generate_sample_pdf_map("T3", fname)
+                pdf_url = get_default_or_sample_pdf_map("T3", fname)
                 floor = Floor(terminal_id=t3.id, name=fname, map_pdf_path=pdf_url)
                 db.add(floor)
             print("[Init] Seeded Terminal T3 with 5 floors")

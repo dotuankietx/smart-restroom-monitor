@@ -14,6 +14,33 @@ from services.state_service import evaluate_toilet_status
 
 router = APIRouter(prefix="/api", tags=["dashboard"])
 
+def resolve_floor_map_image(map_pdf_path: Optional[str]) -> Optional[str]:
+    if not map_pdf_path:
+        return None
+    from config import UPLOAD_DIR
+    from pathlib import Path
+    pdf_rel = map_pdf_path.replace('/uploads/', '').strip()
+    if not pdf_rel:
+        return None
+    jpg_name = Path(pdf_rel).stem + '.jpg'
+    jpg_file = UPLOAD_DIR / jpg_name
+    if not jpg_file.exists():
+        try:
+            import fitz
+            pdf_file = UPLOAD_DIR / pdf_rel
+            if pdf_file.exists():
+                doc = fitz.open(pdf_file)
+                if len(doc) > 0:
+                    pix = doc[0].get_pixmap(dpi=150)
+                    pix.save(str(jpg_file))
+        except Exception as e:
+            print(f'[MapRender] Error rendering {pdf_rel} to image: {e}')
+    if jpg_file.exists():
+        return f'/uploads/{jpg_name}'
+    return None
+
+
+
 @router.get("/terminals")
 def list_terminals(
     db: Session = Depends(get_db),
@@ -44,6 +71,7 @@ def list_terminals(
                 "terminal_name": term.name,
                 "name": fl.name,
                 "map_pdf_path": fl.map_pdf_path,
+                "map_image_path": resolve_floor_map_image(fl.map_pdf_path),
                 "toilet_count": toilet_count
             })
         floors_data.sort(key=lambda x: floor_order_key(x["name"]))
@@ -67,6 +95,8 @@ def get_floor_details(
     toilets_data = []
     now = datetime.now(timezone.utc)
     from config import GATEWAY_OFFLINE_TIMEOUT_SECONDS
+    from services.paper_service import ensure_default_profile
+    default_p = ensure_default_profile(db)
     for t in floor.toilets:
         devices = t.gateway.devices if t.gateway else []
         t_status = evaluate_toilet_status(devices, gateway=t.gateway)
@@ -78,6 +108,7 @@ def get_floor_details(
             ls = gw.last_seen.replace(tzinfo=timezone.utc) if gw.last_seen.tzinfo is None else gw.last_seen
             gw_online = (now - ls).total_seconds() <= GATEWAY_OFFLINE_TIMEOUT_SECONDS
 
+        t_eff_name = t.paper_profile.name if t.paper_profile else default_p.name
         toilets_data.append({
             "id": t.id,
             "name": t.name,
@@ -86,8 +117,14 @@ def get_floor_details(
             "status": t_status,
             "min_paper": min_paper,
             "gateway_id": gw.id if gw else None,
+            "gateway_mac": gw.mac_address if gw else None,
+            "gateway_code": gw.gateway_code if gw else None,
             "gateway_ip": gw.ip_address if gw else None,
             "gateway_online": gw_online,
+            "paper_profile_id": t.paper_profile_id,
+            "paper_profile_name": t.paper_profile.name if t.paper_profile else None,
+            "effective_profile_name": t_eff_name,
+            "source": "TOILET" if t.paper_profile_id else "DEFAULT",
             "gateway_last_seen": gw.last_seen.isoformat() if (gw and gw.last_seen) else None,
             "device_count": len(devices)
         })
@@ -98,6 +135,7 @@ def get_floor_details(
         "terminal_id": floor.terminal_id,
         "terminal_name": floor.terminal.name,
         "map_pdf_path": floor.map_pdf_path,
+        "map_image_path": resolve_floor_map_image(floor.map_pdf_path),
         "toilets": toilets_data
     }
 
@@ -128,15 +166,27 @@ def get_toilet_detail(
 
     from services.discovery_service import discovery_service
     discovered = []
-    if gw_ip:
-        saved_macs = {d.mac_address for d in devices}
-        raw_disc = discovery_service.get_discovered_for_gateway(gw_ip)
-        discovered = [d for d in raw_disc if d["mac_address"] not in saved_macs]
+    if gw:
+        raw_disc = discovery_service.get_discovered_for_gateway(
+            identifier=gw_ip,
+            mac=gw.mac_address,
+            gateway_id=gw.id,
+            toilet_id=toilet.id
+        )
+        saved_macs = {d.mac_address.upper() for d in devices if d.mac_address}
+        discovered = [d for d in raw_disc if d["mac_address"].upper() not in saved_macs]
 
-    from services.paper_service import calculate_metrics_from_percent
+    from services.paper_service import ensure_default_profile, get_effective_settings_for_device, calculate_metrics_from_percent
+    default_p = ensure_default_profile(db)
+    toilet_effective_name = toilet.paper_profile.name if toilet.paper_profile else default_p.name
+
     devices_list = []
     for d in sorted_devices:
-        m = calculate_metrics_from_percent(d.paper_level)
+        d_settings = get_effective_settings_for_device(db, device=d, toilet=toilet)
+        m = calculate_metrics_from_percent(d.paper_level, settings=d_settings)
+        d_eff_name = d.paper_profile.name if d.paper_profile else toilet_effective_name
+        d_source = "DEVICE" if d.paper_profile_id else ("TOILET" if toilet.paper_profile_id else "DEFAULT")
+
         devices_list.append({
             "id": d.id,
             "mac_address": d.mac_address,
@@ -148,7 +198,11 @@ def get_toilet_detail(
             "estimated_uses": m["estimated_uses"],
             "battery": d.battery,
             "status": "OFFLINE" if not gw_online else d.status,
-            "last_seen": d.last_seen.isoformat() if d.last_seen else None
+            "last_seen": d.last_seen.isoformat() if d.last_seen else None,
+            "paper_profile_id": d.paper_profile_id,
+            "paper_profile_name": d.paper_profile.name if d.paper_profile else None,
+            "effective_profile_name": d_eff_name,
+            "source": d_source
         })
 
     return {
@@ -160,9 +214,15 @@ def get_toilet_detail(
         "x": toilet.x,
         "y": toilet.y,
         "gateway_id": gw.id if gw else None,
+        "gateway_mac": gw.mac_address if gw else None,
+        "gateway_code": gw.gateway_code if gw else None,
         "gateway_ip": gw_ip,
         "gateway_online": gw_online,
         "gateway_last_seen": gw_last_seen,
+        "paper_profile_id": toilet.paper_profile_id,
+        "paper_profile_name": toilet.paper_profile.name if toilet.paper_profile else None,
+        "effective_profile_name": toilet_effective_name,
+        "source": "TOILET" if toilet.paper_profile_id else "DEFAULT",
         "status": t_status,
         "devices": devices_list,
         "discovered_devices": discovered
@@ -182,6 +242,24 @@ def get_discovered_clients(
     if ip and ip.strip():
         return discovery_service.get_discovered_for_gateway(ip.strip())
     return discovery_service.get_all_discovered()
+
+@router.delete("/gateways/discovered/{mac_address}")
+async def delete_discovered_client(
+    mac_address: str,
+    user = Depends(require_operator_or_admin)
+):
+    from services.discovery_service import discovery_service
+    from services.state_service import manager
+    clean_mac = mac_address.strip().upper()
+    discovery_service.dismiss_client(clean_mac)
+    
+    await manager.broadcast({
+        "event": "DISCOVERED_CLIENT_DELETED",
+        "data": {
+            "mac_address": clean_mac
+        }
+    })
+    return {"status": "success", "message": f"Client {clean_mac} đã được xóa thành công"}
 
 @router.get("/devices/{device_id}/history", response_model=List[StatusHistoryItem])
 def get_device_history(
@@ -239,6 +317,7 @@ def get_airport_summary(
             "terminal_id": t.floor.terminal_id,
             "floor_name": t.floor.name,
             "floor_id": t.floor_id,
+            "gateway_mac": t.gateway.mac_address if t.gateway else "Chưa gán",
             "gateway_ip": t.gateway.ip_address if t.gateway else "Chưa gán",
             "device_count": len(devices),
             "status": t_status,

@@ -30,26 +30,45 @@ async def receive_gateway_report(
             detail="API Key không hợp lệ hoặc bị thiếu trong header X-API-Key"
         )
 
-    # Determine gateway IP
+    # Determine gateway hardware MAC address and current IP
+    gw_mac = (payload.gateway_mac or payload.gateway_id or payload.gateway_code or "").strip().upper()
     effective_ip = payload.gateway_ip.strip() if payload.gateway_ip else (request.client.host if request.client else "127.0.0.1")
-    print(f"[Gateway API] Received report from IP: {effective_ip} with {len(payload.devices)} devices")
+    print(f"[Gateway API] Received report from MAC='{gw_mac}', IP={effective_ip} with {len(payload.devices)} devices")
 
-    # Find registered gateway, or auto-register if new (WITHOUT auto-creating toilet on map)
-    gateway = db.query(Gateway).filter(Gateway.ip_address == effective_ip).first()
+    gateway = None
+    # 1. TÌM THEO ĐỊA CHỈ MAC CỨNG (Hardware MAC address) TRƯỚC TIÊN!
+    if gw_mac:
+        gateway = db.query(Gateway).filter(
+            (Gateway.mac_address == gw_mac) | (Gateway.gateway_code == gw_mac)
+        ).first()
+
+    # 2. Nếu chưa tìm thấy theo MAC cứng, fallback tìm theo IP
+    if not gateway and effective_ip:
+        gateway = db.query(Gateway).filter(Gateway.ip_address == effective_ip).first()
+        if gateway and gw_mac and not gateway.mac_address:
+            gateway.mac_address = gw_mac
+
+    # 3. Nếu chưa có Gateway trong DB, tự động đăng ký mới với MAC cứng
     if not gateway:
-        print(f"[Gateway API] Gateway IP {effective_ip} is new. Registering Gateway as unassigned...")
-        # [CODE CU]: Tu dong tao Toilet va ghim len ban do tang
-        # assigned_toilet = db.query(Toilet).filter(Toilet.gateway_id == None).first()
-        # ...
-        # [CODE MOI]: Chi tao Gateway trong CSDL voi toilet_id = None. Nguoi dung se tu them Toilet len map sau!
         gateway = Gateway(
+            mac_address=gw_mac if gw_mac else f"GW_{effective_ip.replace('.', '_')}",
+            gateway_code=f"GW_{effective_ip.split('.')[-1]}",
             ip_address=effective_ip,
             toilet_id=None,
             last_seen=datetime.now(timezone.utc)
         )
         db.add(gateway)
         db.flush()
-        print(f"[Gateway API] Successfully registered new Gateway #{gateway.id} (IP: {effective_ip}) - Unassigned Toilet")
+        print(f"[Gateway API] Successfully registered new Gateway #{gateway.id} (MAC: '{gateway.mac_address}', IP: {effective_ip}) - Unassigned Toilet")
+
+    # 4. TỰ ĐỘNG CẬP NHẬT IP MỚI KHI ROUTER CẤP DHCP IP MỚI:
+    # Toilet và vị trí trên bản đồ vẫn gắn chặt với gateway.id / gateway.mac_address!
+    if effective_ip and gateway.ip_address != effective_ip:
+        print(f"[Gateway API] Gateway MAC '{gateway.mac_address or gateway.id}' IP changed: {gateway.ip_address} -> {effective_ip}. Auto-updating current IP while keeping Toilet #{gateway.toilet_id} linked!")
+        other_gws = db.query(Gateway).filter(Gateway.ip_address == effective_ip, Gateway.id != gateway.id).all()
+        for og in other_gws:
+            og.ip_address = None
+        gateway.ip_address = effective_ip
 
     now = datetime.now(timezone.utc)
     gateway.last_seen = now
@@ -67,7 +86,9 @@ async def receive_gateway_report(
         raw_dist = dev_in.distance if dev_in.distance is not None else dev_in.distance_mm
         sensor_st = dev_in.sensor_status if dev_in.sensor_status is not None else 0
 
-        metrics = calculate_paper_metrics(raw_dist, sensor_st)
+        from services.paper_service import get_effective_settings_for_device, calculate_paper_metrics
+        dev_settings = get_effective_settings_for_device(db, device=device, toilet=gateway.toilet)
+        metrics = calculate_paper_metrics(raw_dist, sensor_st, settings=dev_settings)
         calc_paper = metrics["paper_level"]
         new_status = metrics["status"]
         print(f"[Device Report] {clean_mac} -> dist={raw_dist}mm, st={sensor_st}, paper={calc_paper}%, thick={metrics['remaining_thickness_cm']}cm, uses={metrics['estimated_uses']}, bat={dev_in.battery}%, status={new_status}")
@@ -84,7 +105,10 @@ async def receive_gateway_report(
                 distance=raw_dist,
                 remaining_thickness_cm=metrics["remaining_thickness_cm"],
                 remaining_thickness_mm=metrics["remaining_thickness_mm"],
-                estimated_uses=metrics["estimated_uses"]
+                estimated_uses=metrics["estimated_uses"],
+                gateway_mac=gateway.mac_address or gw_mac,
+                gateway_id=gateway.id,
+                toilet_id=gateway.toilet_id
             )
             continue
         
@@ -101,6 +125,7 @@ async def receive_gateway_report(
         has_changed = (old_status is None) or (new_status != old_status) or (abs(device.paper_level - calc_paper) >= 1.0)
         
         device.paper_level = calc_paper
+        device.raw_distance_mm = raw_dist
         device.battery = round(float(dev_in.battery), 1)
         device.status = new_status
         device.last_seen = now
@@ -140,32 +165,40 @@ async def receive_gateway_report(
         })
 
     from services.discovery_service import discovery_service
-    discovered_list = discovery_service.get_discovered_for_gateway(effective_ip)
-    saved_macs = {d.mac_address for d in gateway.devices}
-    unsaved_discovered = [d for d in discovered_list if d["mac_address"] not in saved_macs]
+    discovered_list = discovery_service.get_discovered_for_gateway(
+        identifier=effective_ip,
+        mac=gateway.mac_address,
+        gateway_id=gateway.id,
+        toilet_id=gateway.toilet_id
+    )
+    saved_macs = {d.mac_address.upper() for d in gateway.devices if d.mac_address}
+    unsaved_discovered = [d for d in discovered_list if d["mac_address"].upper() not in saved_macs]
 
-    # Broadcast updated toilet state (including live unsaved discovered devices)
+    # Prepare device metrics and toilet status
+    from services.paper_service import calculate_metrics_from_percent
+    dev_list = []
+    for d in sorted(gateway.devices, key=lambda x: (x.cabin_order if x.cabin_order is not None else 999, x.id)):
+        d_settings = get_effective_settings_for_device(db, device=d, toilet=gateway.toilet)
+        m = calculate_metrics_from_percent(d.paper_level, settings=d_settings)
+        dev_list.append({
+            "id": d.id,
+            "mac_address": d.mac_address,
+            "cabin_order": d.cabin_order if d.cabin_order is not None else 1,
+            "label": d.label,
+            "paper_level": d.paper_level,
+            "remaining_thickness_cm": m["remaining_thickness_cm"],
+            "remaining_thickness_mm": m["remaining_thickness_mm"],
+            "estimated_uses": m["estimated_uses"],
+            "battery": d.battery,
+            "status": d.status,
+            "last_seen": d.last_seen.isoformat() if d.last_seen else None
+        })
+
+    min_paper = min([d.paper_level for d in gateway.devices]) if gateway.devices else 100.0
+    t_status = None
     if gateway.toilet:
         toilet = gateway.toilet
-        t_status = evaluate_toilet_status(gateway.devices)
-        from services.paper_service import calculate_metrics_from_percent
-        dev_list = []
-        for d in sorted(gateway.devices, key=lambda x: (x.cabin_order if x.cabin_order is not None else 999, x.id)):
-            m = calculate_metrics_from_percent(d.paper_level)
-            dev_list.append({
-                "id": d.id,
-                "mac_address": d.mac_address,
-                "cabin_order": d.cabin_order if d.cabin_order is not None else 1,
-                "label": d.label,
-                "paper_level": d.paper_level,
-                "remaining_thickness_cm": m["remaining_thickness_cm"],
-                "remaining_thickness_mm": m["remaining_thickness_mm"],
-                "estimated_uses": m["estimated_uses"],
-                "battery": d.battery,
-                "status": d.status,
-                "last_seen": d.last_seen.isoformat() if d.last_seen else None
-            })
-
+        t_status = evaluate_toilet_status(gateway.devices, gateway=gateway)
         await manager.broadcast({
             "event": "STATE_UPDATE",
             "data": {
@@ -173,19 +206,43 @@ async def receive_gateway_report(
                 "toilet_name": toilet.name,
                 "floor_id": toilet.floor_id,
                 "status": t_status,
+                "toilet_status": t_status,
+                "toilet_min_paper": min_paper,
                 "gateway_id": gateway.id,
+                "gateway_mac": gateway.mac_address,
                 "gateway_ip": effective_ip,
                 "gateway_online": True,
+                "last_seen": now.isoformat(),
                 "devices": dev_list,
                 "discovered_devices": unsaved_discovered
             }
         })
+
+    # Always broadcast GATEWAY_UPDATE for Admin Gateway Tree & realtime listeners
+    await manager.broadcast({
+        "event": "GATEWAY_UPDATE",
+        "data": {
+            "gateway_id": gateway.id,
+            "gateway_mac": gateway.mac_address,
+            "gateway_ip": effective_ip,
+            "is_online": True,
+            "last_seen": now.isoformat(),
+            "toilet_id": gateway.toilet.id if gateway.toilet else None,
+            "toilet_name": gateway.toilet.name if gateway.toilet else None,
+            "status": t_status or "OK",
+            "toilet_status": t_status or "OK",
+            "toilet_min_paper": min_paper if gateway.toilet else None,
+            "devices": dev_list,
+            "discovered_devices": unsaved_discovered
+        }
+    })
 
     # Also broadcast DISCOVERED_CLIENTS_UPDATE for any listener monitoring this gateway IP
     await manager.broadcast({
         "event": "DISCOVERED_CLIENTS_UPDATE",
         "data": {
             "gateway_ip": effective_ip,
+            "gateway_mac": gateway.mac_address,
             "toilet_id": gateway.toilet.id if gateway.toilet else None,
             "discovered_devices": unsaved_discovered
         }
